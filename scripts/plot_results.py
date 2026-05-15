@@ -46,7 +46,10 @@ def _load_results(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str,
                 "latent_mcc": full_test.get("latent_mcc", np.nan),
                 "rank_logdet": full_test.get("rank_logdet", np.nan),
                 "effective_rank": full_test.get("effective_rank", np.nan),
+                "true_rank_logdet": full_test.get("true_rank_logdet", np.nan),
+                "true_effective_rank": full_test.get("true_effective_rank", np.nan),
                 "bias_leakage_r2": full_test.get("bias_leakage_r2", np.nan),
+                "domain_leakage_r2": full_test.get("domain_leakage_r2", np.nan),
                 "gate_f1": gate_metrics.get("gate_f1", np.nan),
             }
         )
@@ -92,8 +95,9 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
     summary_df.to_csv(out_dir / "full_test_summary.csv", index=False)
     subset_df.to_csv(out_dir / "all_subset_metrics.csv", index=False)
 
-    scenarios = ["complementary", "redundant", "biased"]
-    scenario_labels = {"complementary": "Complementary", "redundant": "Redundant", "biased": "Biased"}
+    scenario_order = ["complementary", "redundant", "biased", "domain"]
+    scenarios = [s for s in scenario_order if s in set(summary_df["scenario"])]
+    scenario_labels = {"complementary": "Complementary", "redundant": "Redundant", "biased": "Biased", "domain": "Domain"}
     colors = {"CoreRank": "#2f6fbb", "ERM": "#cc6b49"}
 
     fig, ax = plt.subplots(figsize=(7.6, 4.2))
@@ -148,31 +152,76 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
     fig.savefig(out_dir / "rank_vs_recovery.png")
     plt.close(fig)
 
-    biased = test_subset[test_subset["scenario"] == "biased"].copy()
-    full_biased = summary_df[summary_df["scenario"] == "biased"].copy()
-    fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0))
-    vals = [
-        full_biased["corerank_auroc"].dropna().to_numpy(),
-        full_biased["erm_auroc"].dropna().to_numpy(),
-    ]
-    axes[0].boxplot(vals, tick_labels=["CoreRank", "ERM"], patch_artist=True)
-    axes[0].scatter(np.repeat(1, len(vals[0])), vals[0], color=colors["CoreRank"], zorder=3)
-    axes[0].scatter(np.repeat(2, len(vals[1])), vals[1], color=colors["ERM"], zorder=3)
-    axes[0].set_ylabel("OOD test AUROC")
-    axes[0].set_title("Biased scenario")
-    leak = _mean_sem(biased, ["subset_size"], "bias_leakage_r2")
-    axes[1].errorbar(leak["subset_size"], leak["mean"], yerr=leak["sem"], marker="o", capsize=3, color="#6b5ca5")
-    axes[1].set_xticks([1, 2, 3])
-    axes[1].set_xlabel("Number of observed modalities")
-    axes[1].set_ylabel("Bias leakage R2 from z")
-    axes[1].set_title("Lower leakage is better")
-    for ax in axes:
-        ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(out_dir / "biased_ood_and_leakage.png")
-    plt.close(fig)
+    if {"true_rank_logdet", "true_effective_rank"}.issubset(test_subset.columns) and test_subset["true_rank_logdet"].notna().any():
+        fig, axes = plt.subplots(1, 2, figsize=(9.8, 4.0))
+        for scenario in scenarios:
+            sdf = test_subset[test_subset["scenario"] == scenario]
+            axes[0].scatter(sdf["true_rank_logdet"], sdf["latent_r2"], s=28, alpha=0.75, label=scenario_labels[scenario])
+            axes[1].scatter(sdf["true_effective_rank"], sdf["latent_r2"], s=28, alpha=0.75, label=scenario_labels[scenario])
+        axes[0].set_xlabel("Oracle normalized logdet rank score")
+        axes[0].set_ylabel("Latent linear R2")
+        axes[1].set_xlabel("Oracle effective rank")
+        axes[1].set_ylabel("Latent linear R2")
+        for ax in axes:
+            ax.grid(alpha=0.25)
+        axes[0].legend(frameon=False)
+        fig.suptitle("Oracle rank diagnostics vs. core recovery")
+        fig.tight_layout()
+        fig.savefig(out_dir / "true_rank_vs_recovery.png")
+        plt.close(fig)
+
+    if "biased" in scenarios:
+        biased = test_subset[test_subset["scenario"] == "biased"].copy()
+        full_biased = summary_df[summary_df["scenario"] == "biased"].copy()
+        fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0))
+        vals = [
+            full_biased["corerank_auroc"].dropna().to_numpy(),
+            full_biased["erm_auroc"].dropna().to_numpy(),
+        ]
+        axes[0].boxplot(vals, tick_labels=["CoreRank", "ERM"], patch_artist=True)
+        axes[0].scatter(np.repeat(1, len(vals[0])), vals[0], color=colors["CoreRank"], zorder=3)
+        axes[0].scatter(np.repeat(2, len(vals[1])), vals[1], color=colors["ERM"], zorder=3)
+        axes[0].set_ylabel("OOD test AUROC")
+        axes[0].set_title("Biased scenario")
+        leak = _mean_sem(biased, ["subset_size"], "bias_leakage_r2")
+        axes[1].errorbar(leak["subset_size"], leak["mean"], yerr=leak["sem"], marker="o", capsize=3, color="#6b5ca5")
+        axes[1].set_xticks([1, 2, 3])
+        axes[1].set_xlabel("Number of observed modalities")
+        axes[1].set_ylabel("Bias leakage R2 from z")
+        axes[1].set_title("Lower leakage is better")
+        for ax in axes:
+            ax.grid(axis="y", alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(out_dir / "biased_ood_and_leakage.png")
+        plt.close(fig)
+
+    if "domain" in scenarios:
+        domain = test_subset[test_subset["scenario"] == "domain"].copy()
+        full_domain = summary_df[summary_df["scenario"] == "domain"].copy()
+        fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0))
+        vals = [
+            full_domain["corerank_auroc"].dropna().to_numpy(),
+            full_domain["erm_auroc"].dropna().to_numpy(),
+        ]
+        axes[0].boxplot(vals, tick_labels=["CoreRank", "ERM"], patch_artist=True)
+        axes[0].scatter(np.repeat(1, len(vals[0])), vals[0], color=colors["CoreRank"], zorder=3)
+        axes[0].scatter(np.repeat(2, len(vals[1])), vals[1], color=colors["ERM"], zorder=3)
+        axes[0].set_ylabel("Shifted-domain test AUROC")
+        axes[0].set_title("Domain scenario")
+        leak = _mean_sem(domain, ["subset_size"], "domain_leakage_r2")
+        axes[1].errorbar(leak["subset_size"], leak["mean"], yerr=leak["sem"], marker="o", capsize=3, color="#5d7f55")
+        axes[1].set_xticks([1, 2, 3])
+        axes[1].set_xlabel("Number of observed modalities")
+        axes[1].set_ylabel("Domain leakage R2 from z")
+        axes[1].set_title("Lower leakage is better")
+        for ax in axes:
+            ax.grid(axis="y", alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(out_dir / "domain_shift_and_leakage.png")
+        plt.close(fig)
 
     fig, axes = plt.subplots(len(scenarios), 2, figsize=(7.8, 8.4), constrained_layout=True)
+    axes = np.atleast_2d(axes)
     for row, scenario in enumerate(scenarios):
         for col, (title, mat) in enumerate([("Learned mean gate", mean_gates[scenario]), ("True footprint", true_fp[scenario])]):
             ax = axes[row, col]

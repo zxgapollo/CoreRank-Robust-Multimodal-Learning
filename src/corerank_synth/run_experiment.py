@@ -11,7 +11,7 @@ from .train import TrainConfig, train_corerank, train_erm_baseline
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run CoreRank synthetic benchmark.")
-    p.add_argument("--scenario", type=str, default="complementary", choices=["complementary", "redundant", "biased"])
+    p.add_argument("--scenario", type=str, default="complementary", choices=["complementary", "redundant", "biased", "domain"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-train", type=int, default=5000)
     p.add_argument("--n-val", type=int, default=1000)
@@ -25,6 +25,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--biased-modality", type=int, default=0)
     p.add_argument("--train-bias-corr", type=float, default=0.85)
     p.add_argument("--test-bias-corr", type=float, default=-0.50)
+    p.add_argument("--domain-shift-strength", type=float, default=None)
+    p.add_argument("--domain-shifted-modality", type=int, default=0)
+    p.add_argument("--core-graph-strength", type=float, default=0.35)
 
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=256)
@@ -42,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--modality-dropout", type=float, default=0.15)
     p.add_argument("--max-fisher-batch", type=int, default=64)
     p.add_argument("--eval-fisher-batches", type=int, default=4)
+    p.add_argument("--eval-true-fisher-samples", type=int, default=256)
     p.add_argument("--rank-warmup-epochs", type=int, default=5)
     p.add_argument("--sparse-warmup-epochs", type=int, default=10)
     p.add_argument("--fisher-damping", type=float, default=1e-3)
@@ -51,6 +55,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decoder-layers", type=int, default=2)
     p.add_argument("--gate-temperature", type=float, default=0.67)
     p.add_argument("--init-gate-logit", type=float, default=0.0)
+    p.add_argument("--gate-temperature-min", type=float, default=0.2)
+    p.add_argument("--gate-anneal-epochs", type=int, default=0)
+    p.add_argument("--gate-l1-weight", type=float, default=0.0)
+    p.add_argument("--gate-binary-weight", type=float, default=0.0)
     p.add_argument("--no-rank", action="store_true")
     p.add_argument("--no-sparse", action="store_true")
     p.add_argument("--skip-erm", action="store_true")
@@ -67,6 +75,9 @@ def main() -> None:
     bias_strength = args.bias_strength
     if bias_strength is None:
         bias_strength = 2.0 if args.scenario == "biased" else 0.0
+    domain_shift_strength = args.domain_shift_strength
+    if domain_shift_strength is None:
+        domain_shift_strength = 1.5 if args.scenario == "domain" else 0.0
 
     scfg = SyntheticConfig(
         scenario=args.scenario,
@@ -83,6 +94,9 @@ def main() -> None:
         biased_modality=args.biased_modality,
         train_bias_corr=args.train_bias_corr,
         test_bias_corr=args.test_bias_corr,
+        domain_shift_strength=domain_shift_strength,
+        domain_shifted_modality=args.domain_shifted_modality,
+        core_graph_strength=args.core_graph_strength,
     )
     tcfg = TrainConfig(
         epochs=args.epochs,
@@ -101,6 +115,7 @@ def main() -> None:
         modality_dropout=args.modality_dropout,
         max_fisher_batch=args.max_fisher_batch,
         eval_fisher_batches=args.eval_fisher_batches,
+        eval_true_fisher_samples=args.eval_true_fisher_samples,
         rank_warmup_epochs=args.rank_warmup_epochs,
         sparse_warmup_epochs=args.sparse_warmup_epochs,
         fisher_damping=args.fisher_damping,
@@ -113,6 +128,10 @@ def main() -> None:
         decoder_layers=args.decoder_layers,
         gate_temperature=args.gate_temperature,
         init_gate_logit=args.init_gate_logit,
+        gate_temperature_min=args.gate_temperature_min,
+        gate_anneal_epochs=args.gate_anneal_epochs,
+        gate_l1_weight=args.gate_l1_weight,
+        gate_binary_weight=args.gate_binary_weight,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)

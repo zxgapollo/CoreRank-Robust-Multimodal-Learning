@@ -10,7 +10,7 @@ The core idea is sound as a synthetic-testable claim if stated locally:
 
 > A modality is useful for robust prediction when it adds nuisance-adjusted Fisher directions for the recoverable disease-core block.
 
-The benchmark is not claiming global causal graph identification. It tests local disease-core recoverability, sparse modality-to-core footprint recovery, missing-modality behavior, and robustness under a controlled spurious-bias shift.
+The benchmark is not claiming global causal graph identification. It tests local disease-core recoverability, sparse modality-to-core footprint recovery, missing-modality behavior, robustness under a controlled spurious-bias shift, and robustness under a controlled domain/mechanism shift.
 
 ## Quick start
 
@@ -58,6 +58,18 @@ python -m corerank_synth.run_experiment \
   --n-train 1024 --n-val 512 --n-test 512 \
   --epochs 5 --batch-size 128 \
   --output-dir outputs/smoke_biased
+```
+
+Domain/mechanism-shift smoke test:
+
+```bash
+python -m corerank_synth.run_experiment \
+  --scenario domain \
+  --domain-shifted-modality 0 \
+  --domain-shift-strength 1.5 \
+  --n-train 1024 --n-val 512 --n-test 512 \
+  --epochs 5 --batch-size 128 \
+  --output-dir outputs/smoke_domain
 ```
 
 ## UC Davis Farm A100

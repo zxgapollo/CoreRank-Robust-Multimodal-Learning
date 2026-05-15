@@ -13,7 +13,7 @@ BATCH_SIZE=${BATCH_SIZE:-256}
 cd "$PROJECT_DIR"
 export PYTHONNOUSERSITE=1
 
-for SCENARIO in complementary redundant biased; do
+for SCENARIO in complementary redundant biased domain; do
   for SEED in 0 1 2 3 4; do
     OUT="$BASE/${SCENARIO}_seed${SEED}"
     "$PYTHON_BIN" -m corerank_synth.run_experiment \
@@ -23,6 +23,8 @@ for SCENARIO in complementary redundant biased; do
       --epochs "$EPOCHS" --batch-size "$BATCH_SIZE" \
       --z-dim 6 --u-dim 3 --x-dim 16 \
       --rank-kappa 0.5 --sparse-budget 9.0 \
+      --gate-anneal-epochs "$EPOCHS" --gate-temperature-min 0.2 \
+      --gate-binary-weight 0.01 \
       --output-dir "$OUT"
   done
 done

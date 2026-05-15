@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .data import SyntheticConfig, SyntheticDataset, SyntheticParams, SyntheticSplit, collate_batch
+from .data import SyntheticConfig, SyntheticDataset, SyntheticParams, SyntheticSplit, collate_batch, true_fisher_for_split
 from .fisher import batch_core_information, rank_score_from_K
 from .metrics import binary_metrics, footprint_metrics, linear_probe_r2, mean_corrcoef_matching, ridge_r2
 from .models import CoreRankVAE, EarlyFusionClassifier, ModelConfig, kl_standard_normal
@@ -44,11 +44,16 @@ class TrainConfig:
     no_sparse: bool = False
     seed: int = 0
     eval_fisher_batches: int = 4
+    eval_true_fisher_samples: int = 256
     hidden_dim: int = 64
     encoder_layers: int = 2
     decoder_layers: int = 2
     gate_temperature: float = 0.67
     init_gate_logit: float = 0.0
+    gate_temperature_min: float = 0.2
+    gate_anneal_epochs: int = 0
+    gate_l1_weight: float = 0.0
+    gate_binary_weight: float = 0.0
 
 
 def _set_seed(seed: int) -> None:
@@ -79,6 +84,7 @@ def _to_device(batch: Dict, device: str) -> Dict:
         "z": batch["z"].to(device),
         "u": [um.to(device) for um in batch["u"]],
         "bias": [bm.to(device) for bm in batch["bias"]],
+        "domain": batch["domain"].to(device),
     }
 
 
@@ -147,6 +153,11 @@ def train_corerank(
 
     for epoch in range(tcfg.epochs):
         model.train()
+        if tcfg.gate_anneal_epochs > 0:
+            frac = min(1.0, epoch / max(1, tcfg.gate_anneal_epochs - 1))
+            start = max(tcfg.gate_temperature, 1e-6)
+            end = max(tcfg.gate_temperature_min, 1e-6)
+            model.gates.temperature = float(start * ((end / start) ** frac))
         pbar = tqdm(loader, desc=f"CoreRank epoch {epoch+1}/{tcfg.epochs}", leave=False)
         epoch_logs: Dict[str, List[float]] = {}
         rank_active = (epoch + 1) > tcfg.rank_warmup_epochs and not tcfg.no_rank
@@ -173,10 +184,17 @@ def train_corerank(
                 loss = loss + lambda_rank.detach() * rank_violation + 0.5 * tcfg.rho_rank * rank_violation.pow(2)
 
             omega = model.gates.expected_l0()
+            gate = model.gates()
+            gate_l1 = omega / gate.numel()
+            gate_binary = (gate * (1.0 - gate)).mean()
             sparse_violation = torch.tensor(0.0, device=device)
             if sparse_active:
                 sparse_violation = F.relu(omega - torch.tensor(tcfg.sparse_budget, device=device))
                 loss = loss + lambda_sparse.detach() * sparse_violation + 0.5 * tcfg.rho_sparse * sparse_violation.pow(2)
+                if tcfg.gate_l1_weight > 0:
+                    loss = loss + tcfg.gate_l1_weight * gate_l1
+                if tcfg.gate_binary_weight > 0:
+                    loss = loss + tcfg.gate_binary_weight * gate_binary
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -194,6 +212,9 @@ def train_corerank(
                 "rank_score": float(rank_score.detach().cpu()),
                 "rank_violation": float(rank_violation.detach().cpu()),
                 "omega_g": float(omega.detach().cpu()),
+                "gate_l1": float(gate_l1.detach().cpu()),
+                "gate_binary": float(gate_binary.detach().cpu()),
+                "gate_temperature": float(model.gates.temperature),
                 "sparse_violation": float(sparse_violation.detach().cpu()),
                 "lambda_rank": float(lambda_rank.detach().cpu()),
                 "lambda_sparse": float(lambda_sparse.detach().cpu()),
@@ -226,7 +247,7 @@ def train_corerank(
 def _collect_predictions(model: CoreRankVAE, split: SyntheticSplit, scfg: SyntheticConfig, tcfg: TrainConfig, subset: Tuple[int, ...]) -> Dict[str, np.ndarray]:
     device = tcfg.device
     loader = DataLoader(SyntheticDataset(split), batch_size=tcfg.batch_size, shuffle=False, collate_fn=collate_batch)
-    zs, ztrue, probs, ys, biases = [], [], [], [], []
+    zs, ztrue, probs, ys, biases, domains = [], [], [], [], [], []
     obs_template = torch.zeros(scfg.n_modalities, device=device)
     obs_template[list(subset)] = 1.0
     model.eval()
@@ -240,12 +261,14 @@ def _collect_predictions(model: CoreRankVAE, split: SyntheticSplit, scfg: Synthe
         probs.append(prob.cpu().numpy())
         ys.append(batch["y"].cpu().numpy())
         biases.append(np.concatenate([b.cpu().numpy() for b in batch["bias"]], axis=1))
+        domains.append(batch["domain"].cpu().numpy())
     return {
         "z_hat": np.concatenate(zs, axis=0),
         "z_true": np.concatenate(ztrue, axis=0),
         "prob": np.concatenate(probs, axis=0),
         "y": np.concatenate(ys, axis=0),
         "bias": np.concatenate(biases, axis=0),
+        "domain": np.concatenate(domains, axis=0),
     }
 
 
@@ -282,6 +305,35 @@ def _estimate_rank_diagnostics(model: CoreRankVAE, split: SyntheticSplit, scfg: 
     return {k: float(np.mean([v[k] for v in vals])) for k in vals[0]}
 
 
+def _slice_split(split: SyntheticSplit, n: int) -> SyntheticSplit:
+    return SyntheticSplit(
+        x=[xm[:n] for xm in split.x],
+        y=split.y[:n],
+        z=split.z[:n],
+        u=[um[:n] for um in split.u],
+        bias=[bm[:n] for bm in split.bias],
+        domain=split.domain[:n],
+    )
+
+
+def _estimate_true_rank_diagnostics(
+    split: SyntheticSplit,
+    params: SyntheticParams,
+    scfg: SyntheticConfig,
+    tcfg: TrainConfig,
+    subset: Tuple[int, ...],
+) -> Dict[str, float]:
+    n = min(tcfg.eval_true_fisher_samples, split.y.shape[0])
+    K = true_fisher_for_split(_slice_split(split, n), params, scfg, list(subset))
+    score, diag = rank_score_from_K(K, eps=tcfg.rank_eps)
+    return {
+        "true_rank_logdet": float(score.detach().cpu()),
+        "true_effective_rank": float(diag["effective_rank"].mean().cpu()),
+        "true_min_eig": float(diag["min_eig"].mean().cpu()),
+        "true_trace_K": float(diag["trace"].mean().cpu()),
+    }
+
+
 def evaluate_model(
     model: CoreRankVAE,
     train: SyntheticSplit,
@@ -309,8 +361,13 @@ def evaluate_model(
                     row["bias_leakage_r2"] = linear_probe_r2(pred["z_hat"], bias_target)
                 else:
                     row["bias_leakage_r2"] = float("nan")
+                if scfg.domain_shift_strength > 0:
+                    row["domain_leakage_r2"] = linear_probe_r2(pred["z_hat"], pred["domain"])
+                else:
+                    row["domain_leakage_r2"] = float("nan")
                 if split_name in {"val", "test"}:
                     row.update(_estimate_rank_diagnostics(model, split, scfg, tcfg, subset))
+                    row.update(_estimate_true_rank_diagnostics(split, params, scfg, tcfg, subset))
                 all_rows.append(row)
     subset_df = pd.DataFrame(all_rows)
 

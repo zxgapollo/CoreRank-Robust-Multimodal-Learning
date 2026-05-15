@@ -1,6 +1,6 @@
 # CoreRank Synthetic Benchmark and Model Design
 
-This document specifies a deployable synthetic benchmark and a first implementation of **CoreRank**, a constrained-likelihood multimodal generative model for recovering a task-relevant disease core from biased, heterogeneous modalities.
+This document specifies a deployable synthetic benchmark and a first implementation of **CoreRank**, a constrained-likelihood multimodal generative model for recovering a task-relevant disease core from biased, heterogeneous, and partially observed modalities.
 
 The implementation is intentionally scoped to the synthetic benchmark first. It is designed so that Codex can extend it to real medical datasets after the core theory-method alignment is validated.
 
@@ -10,16 +10,17 @@ The implementation is intentionally scoped to the synthetic benchmark first. It 
 
 We want to test the following claim:
 
-> A medical modality helps robust prediction only when it contributes new **nuisance-adjusted Fisher-rank directions** for recovering a minimal disease core `Z*`; it may hurt when it mostly contributes redundant directions or modality-private bias.
+> A medical modality helps robust prediction only when it contributes new **nuisance-adjusted Fisher-rank directions** for recovering a minimal disease core `Z*`; it may hurt when it mostly contributes redundant directions, domain-specific measurement shifts, or modality-private shortcuts.
 
 The synthetic benchmark must therefore expose ground-truth values for:
 
-1. disease core `Z*`,
+1. disease core `Z*` and its latent causal graph `A*`,
 2. modality-private nuisance variables `U_m`,
-3. modality-to-core footprint graph `G*`,
-4. true modality evidence matrices and effective core rank,
-5. missing-modality and bias-shift settings,
-6. robust prediction targets.
+3. non-core context/shortcut variables such as age, site, scanner, visit timing, or gene covariates,
+4. modality-to-core footprint graph `G*`,
+5. true modality evidence matrices and effective core rank,
+6. missing-modality, concept-shift, and domain-shift settings,
+7. robust prediction targets.
 
 The first implementation should **not** claim full causal graph recovery. It should test local recoverability of the disease-core block and, optionally, sparse footprint recovery.
 
@@ -47,17 +48,37 @@ The learned factors are automatically causal disease mechanisms.
 
 In the synthetic benchmark, all modalities are treated as observations carrying posterior evidence about `Z*`. Whether a modality is upstream or downstream of the disease core is not used by the method.
 
-### 2.3 Use a footprint graph, not a full latent DAG
+### 2.3 Distinguish the core causal graph from the footprint graph
 
-The graph in this benchmark is the **modality-to-core footprint graph**:
+The benchmark may expose a latent causal graph among core variables:
+
+```text
+A*[j, k] != 0 iff disease-core coordinate Z_k is a direct parent of Z_j.
+```
+
+This graph is useful for data generation and for motivating examples such as age affecting recognition. The first CoreRank implementation does **not** learn this graph and should not claim internal causal-DAG recovery.
+
+The graph learned by the first implementation is instead the **modality-to-core footprint graph**:
 
 ```text
 G[m, j] = 1  iff modality m contains recoverable evidence about disease-core coordinate Z_j.
 ```
 
-This is different from an internal causal graph among disease factors. The first implementation only learns `G`. It does not learn a directed graph `A` among core components.
+This is different from an internal causal graph among disease factors.
 
-### 2.4 Do not implement the objective as a loss pile
+### 2.4 Core variables are not all modality-causing variables
+
+The disease core is a minimal task-relevant latent block, not a bucket containing every variable that affects a modality. Variables such as age, sex, gene status, scanner/site, acquisition protocol, and visit timing may affect a modality or even affect an intermediate cognitive measurement, but they should not automatically become part of the disease core.
+
+For example, age can affect recognition scores. If the target is Alzheimer disease status, the path
+
+```text
+Age -> recognition-like measurement -> classifier
+```
+
+can be a problematic shortcut when train and test age distributions differ. CoreRank should represent this as context/nuisance-adjusted evidence, not as proof that age itself is a disease-core coordinate.
+
+### 2.5 Do not implement the objective as a loss pile
 
 The paper formulation should be:
 
@@ -82,7 +103,7 @@ min -L_ELBO
 
 This is not described as an arbitrary regularizer stack. The rank and sparsity terms are relaxations of explicit constraints.
 
-### 2.5 Conditional independence is an approximation
+### 2.6 Conditional independence is an approximation
 
 The simple model computes
 
@@ -102,17 +123,28 @@ For each sample:
 
 ```math
 Z* in R^r                    disease core
+A*                           latent causal graph among disease-core coordinates
+C                            observed or latent non-core context: age, sex, site, gene, scanner, visit timing
 U_m in R^q                   modality-private nuisance / bias
 Y ~ Bernoulli(sigmoid(beta^T Z* + nonlinear terms))
 ```
 
+The synthetic code samples `Z*` from a simple acyclic structural equation model:
+
+```math
+Z_j = sum_{k in Pa(j)} A^*_{jk} Z_k + E_j.
+```
+
+This allows us to talk about causal relations among core coordinates while keeping graph recovery out of scope for the first method.
+
 Each modality is generated from a subset of disease-core coordinates and its private nuisance:
 
 ```math
-X_m = f_m(G*_m \odot Z*, U_m, B_m, eps_m).
+X_m = f_m(G*_m \odot Z*, U_m, C, B_m, D_m, eps_m).
 ```
 
 `B_m` is an explicit spurious bias variable used for robustness testing. It affects the modality but is not a true cause of `Y`.
+`D_m` is a domain/mechanism variable such as site or scanner shift. It changes the observation mechanism but not the disease label mechanism.
 
 ### 3.2 Nuisance-adjusted core Fisher
 
@@ -302,9 +334,11 @@ Expected behavior:
 2. Prediction gain from adding modality 2 to modality 0 should be small.
 3. Rank-gain should be predictive of downstream gain.
 
-### 6.3 Biased modality scenario
+### 6.3 Case-I: concept/covariate shortcut shift
 
-Purpose: test robustness when one modality contains a strong spurious nuisance correlated with the label in training but shifted at test time.
+Purpose: test robustness when one modality contains a strong non-core shortcut correlated with the label in training but shifted at test time.
+
+This is the synthetic analogue of the PPT case where age affects a recognition-like measurement, but using the age-related path as an Alzheimer classifier shortcut is unstable when the age distribution differs between train and test.
 
 Generation:
 
@@ -322,7 +356,33 @@ Expected behavior:
 2. CoreRank should be more robust if the nuisance pathway `u_m` absorbs the bias and the classifier is restricted to `z`.
 3. Measure bias leakage by predicting the known bias scalar from learned `z_hat`. Lower is better.
 
-### 6.4 Missing-modality scenario
+### 6.4 Case-II: domain/mechanism shift
+
+Purpose: test robustness when a modality's observation mechanism changes across domains, even though the disease-label mechanism remains stable.
+
+Examples:
+
+```text
+site/scanner/protocol -> MRI feature distribution
+visit schedule        -> measurement availability / measurement noise
+hospital population   -> lab calibration or coding practice
+```
+
+Generation:
+
+```math
+X_m = f_m(G^*_m \odot Z^*, U_m, eps_m) + gamma_domain D_m v_m.
+```
+
+Train and validation have one domain value; OOD test shifts `D_m`. This should be absorbed by nuisance/domain-specific variation rather than becoming disease-core evidence.
+
+Expected behavior:
+
+1. ERM may lose performance if it uses domain-specific measurement artifacts.
+2. CoreRank should be less sensitive when the shifted direction is nuisance-adjusted.
+3. Oracle Fisher diagnostics should still identify which observed modalities carry recoverable core directions.
+
+### 6.5 Case-III: missing information / incomplete core coverage
 
 Purpose: test that posterior uncertainty and rank score predict degradation under missing modalities.
 
@@ -342,6 +402,8 @@ Expected behavior:
 ```text
 Higher logdet/effective-rank should correlate with higher latent recovery and better prediction.
 ```
+
+This case is not just random missingness. It asks whether the observed subset `O` contains enough nuisance-adjusted evidence to recover the disease-core block needed for prediction.
 
 ---
 
@@ -395,6 +457,7 @@ Fit a ridge/logistic probe from `z_hat` to known nuisance bias variables. Lower 
 Concatenate available modalities and train a classifier.
 
 This tests whether ordinary discriminative fusion overfits spurious modalities.
+ERM is a discriminative baseline: it directly learns `p(y | x_1, ..., x_M)` or a decision boundary from observed features to labels. It does not model `Z*`, modality-private nuisance, domain variables, or missing-modality uncertainty.
 
 ### 8.2 CoreRank without rank constraint
 
@@ -414,7 +477,7 @@ Evaluate the same model using one modality at a time. This gives the modality su
 
 The current code implements:
 
-1. synthetic data generation for complementary, redundant, and biased scenarios;
+1. synthetic data generation for complementary, redundant, biased, and domain-shift scenarios;
 2. CoreRankVAE with PoE posterior, private nuisance variables, soft footprint gates;
 3. decoder-induced nuisance-adjusted Fisher via autograd Jacobians;
 4. normalized-logdet core-rank constraint;
@@ -422,11 +485,14 @@ The current code implements:
 6. augmented Lagrangian training;
 7. missing-modality evaluation over all modality subsets;
 8. ERM baseline;
-9. metrics and CSV/JSON output.
+9. true-generator Fisher/rank diagnostics for the synthetic benchmark;
+10. bias/domain leakage probes from learned `z_hat`;
+11. temperature annealing and binary pressure options for soft footprint gates;
+12. metrics and CSV/JSON output.
 
 The first code drop does **not** implement:
 
-1. internal disease-core DAG `A`;
+1. learning the internal disease-core DAG `A`;
 2. real medical datasets;
 3. joint Fisher for shared nuisance;
 4. hard-concrete gates;
@@ -445,6 +511,7 @@ Scenario grid:
   complementary
   redundant
   biased
+  domain
 
 Sample sizes:
   1000, 3000, 10000
@@ -454,6 +521,9 @@ Noise std:
 
 Bias strength:
   0.0, 1.0, 2.0
+
+Domain shift strength:
+  0.0, 1.0, 1.5, 2.0
 
 Training variants:
   corerank_full
@@ -467,8 +537,10 @@ Primary plots:
 1. `logdet(Kbar_O)` vs latent R2 across modality subsets.
 2. `logdet(Kbar_O)` vs AUROC across modality subsets.
 3. test-OOD AUROC under bias shift.
-4. learned gate heatmap vs true footprint.
-5. eigenvalue spectra for single modalities and all modalities.
+4. test-OOD AUROC under domain/mechanism shift.
+5. learned gate heatmap vs true footprint.
+6. learned-decoder rank vs true-generator rank.
+7. eigenvalue spectra for single modalities and all modalities.
 
 ---
 
@@ -517,6 +589,8 @@ The implementation is scientifically useful if it demonstrates the following:
 1. In the complementary scenario, all modalities produce full effective rank and better latent recovery than unimodal subsets.
 2. In the redundant scenario, adding redundant modalities gives small rank gain and small prediction gain.
 3. In the biased scenario, CoreRank has lower OOD degradation and lower bias leakage than ERM fusion.
-4. Learned gates recover a sparse approximation of the ground-truth footprint.
-5. Removing the rank constraint reduces the alignment between `logdet(Kbar)` and latent recovery.
-6. Removing the sparse footprint constraint weakens footprint recovery and component-level interpretability.
+4. In the domain scenario, CoreRank is less sensitive to the shifted measurement mechanism and has lower domain leakage than ERM-like representations.
+5. Learned gates recover a sparse approximation of the ground-truth footprint after annealing or a harder gate relaxation.
+6. Learned-decoder rank agrees directionally with true-generator rank; if it saturates, report true rank separately and treat learned rank as a model diagnostic, not ground truth.
+7. Removing the rank constraint reduces the alignment between `logdet(Kbar)` and latent recovery.
+8. Removing the sparse footprint constraint weakens footprint recovery and component-level interpretability.
