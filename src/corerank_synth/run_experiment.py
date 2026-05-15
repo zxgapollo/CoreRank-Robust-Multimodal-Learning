@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from dataclasses import asdict
+
+from .data import SyntheticConfig, make_synthetic_data
+from .train import TrainConfig, train_corerank, train_erm_baseline
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run CoreRank synthetic benchmark.")
+    p.add_argument("--scenario", type=str, default="complementary", choices=["complementary", "redundant", "biased"])
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--n-train", type=int, default=5000)
+    p.add_argument("--n-val", type=int, default=1000)
+    p.add_argument("--n-test", type=int, default=2000)
+    p.add_argument("--z-dim", type=int, default=6)
+    p.add_argument("--u-dim", type=int, default=3)
+    p.add_argument("--n-modalities", type=int, default=3)
+    p.add_argument("--x-dim", type=int, default=16)
+    p.add_argument("--noise-std", type=float, default=0.35)
+    p.add_argument("--bias-strength", type=float, default=None)
+    p.add_argument("--biased-modality", type=int, default=0)
+    p.add_argument("--train-bias-corr", type=float, default=0.85)
+    p.add_argument("--test-bias-corr", type=float, default=-0.50)
+
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=1e-5)
+    p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--beta-z", type=float, default=1e-3)
+    p.add_argument("--beta-u", type=float, default=1e-3)
+    p.add_argument("--recon-weight", type=float, default=1.0)
+    p.add_argument("--label-weight", type=float, default=1.0)
+    p.add_argument("--rank-kappa", type=float, default=0.5)
+    p.add_argument("--sparse-budget", type=float, default=9.0)
+    p.add_argument("--rho-rank", type=float, default=1.0)
+    p.add_argument("--rho-sparse", type=float, default=0.1)
+    p.add_argument("--modality-dropout", type=float, default=0.15)
+    p.add_argument("--max-fisher-batch", type=int, default=64)
+    p.add_argument("--eval-fisher-batches", type=int, default=4)
+    p.add_argument("--rank-warmup-epochs", type=int, default=5)
+    p.add_argument("--sparse-warmup-epochs", type=int, default=10)
+    p.add_argument("--fisher-damping", type=float, default=1e-3)
+    p.add_argument("--rank-eps", type=float, default=1e-3)
+    p.add_argument("--hidden-dim", type=int, default=64)
+    p.add_argument("--encoder-layers", type=int, default=2)
+    p.add_argument("--decoder-layers", type=int, default=2)
+    p.add_argument("--gate-temperature", type=float, default=0.67)
+    p.add_argument("--init-gate-logit", type=float, default=0.0)
+    p.add_argument("--no-rank", action="store_true")
+    p.add_argument("--no-sparse", action="store_true")
+    p.add_argument("--skip-erm", action="store_true")
+    p.add_argument("--output-dir", type=str, default="outputs/run")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    import torch
+    device = args.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    bias_strength = args.bias_strength
+    if bias_strength is None:
+        bias_strength = 2.0 if args.scenario == "biased" else 0.0
+
+    scfg = SyntheticConfig(
+        scenario=args.scenario,
+        seed=args.seed,
+        n_train=args.n_train,
+        n_val=args.n_val,
+        n_test=args.n_test,
+        z_dim=args.z_dim,
+        u_dim=args.u_dim,
+        n_modalities=args.n_modalities,
+        x_dim=args.x_dim,
+        noise_std=args.noise_std,
+        bias_strength=bias_strength,
+        biased_modality=args.biased_modality,
+        train_bias_corr=args.train_bias_corr,
+        test_bias_corr=args.test_bias_corr,
+    )
+    tcfg = TrainConfig(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        device=device,
+        beta_z=args.beta_z,
+        beta_u=args.beta_u,
+        recon_weight=args.recon_weight,
+        label_weight=args.label_weight,
+        rank_kappa=args.rank_kappa,
+        sparse_budget=args.sparse_budget,
+        rho_rank=args.rho_rank,
+        rho_sparse=args.rho_sparse,
+        modality_dropout=args.modality_dropout,
+        max_fisher_batch=args.max_fisher_batch,
+        eval_fisher_batches=args.eval_fisher_batches,
+        rank_warmup_epochs=args.rank_warmup_epochs,
+        sparse_warmup_epochs=args.sparse_warmup_epochs,
+        fisher_damping=args.fisher_damping,
+        rank_eps=args.rank_eps,
+        no_rank=args.no_rank,
+        no_sparse=args.no_sparse,
+        seed=args.seed,
+        hidden_dim=args.hidden_dim,
+        encoder_layers=args.encoder_layers,
+        decoder_layers=args.decoder_layers,
+        gate_temperature=args.gate_temperature,
+        init_gate_logit=args.init_gate_logit,
+    )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, "config.json"), "w") as f:
+        json.dump({"synthetic": scfg.to_dict(), "train": asdict(tcfg)}, f, indent=2)
+
+    train, val, test, params = make_synthetic_data(scfg)
+    model, metrics, subset_df = train_corerank(train, val, test, params, scfg, tcfg, args.output_dir)
+    result = {"corerank": metrics}
+    if not args.skip_erm:
+        erm_metrics = train_erm_baseline(train, val, test, scfg, tcfg, args.output_dir, epochs=max(3, min(args.epochs, 30)))
+        result["erm"] = erm_metrics
+    with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
+        json.dump(result, f, indent=2)
+    print(json.dumps(result, indent=2)[:4000])
+
+
+if __name__ == "__main__":
+    main()
