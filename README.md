@@ -59,3 +59,35 @@ python -m corerank_synth.run_experiment \
   --epochs 5 --batch-size 128 \
   --output-dir outputs/smoke_biased
 ```
+
+## UC Davis Farm A100
+
+Project path:
+
+```bash
+/group/datalabgrp/xgzhu/CoreRank-Robust-Multimodal-Learning
+```
+
+Environment path:
+
+```bash
+/group/datalabgrp/xgzhu/env/corerank_synth
+```
+
+Interactive A100 allocation:
+
+```bash
+bash scripts/farm_srun_a100.sh
+```
+
+Run Farm smoke tests inside the allocation:
+
+```bash
+bash scripts/run_farm_smoke.sh
+```
+
+Submit the full synthetic grid as a detached Slurm job:
+
+```bash
+bash scripts/submit_farm_main.sh outputs/main_grid_gpu
+```
