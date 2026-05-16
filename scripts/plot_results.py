@@ -9,11 +9,15 @@ import numpy as np
 import pandas as pd
 
 
-def _load_results(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+def _load_results(
+    base_dir: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     summary_rows: List[dict] = []
     subset_rows: List[pd.DataFrame] = []
     gates: Dict[str, List[np.ndarray]] = {}
     true_fp: Dict[str, np.ndarray] = {}
+    core_graphs: Dict[str, List[np.ndarray]] = {}
+    true_core_graph: Dict[str, np.ndarray] = {}
 
     for run_dir in sorted(base_dir.glob("*_seed*")):
         if not run_dir.is_dir():
@@ -34,6 +38,7 @@ def _load_results(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str,
         full_test = corerank["full_test"]
         erm_full = summary.get("erm", {}).get("erm_full_test", {})
         gate_metrics = corerank["gate_metrics"]
+        graph_metrics = corerank.get("graph_metrics", {})
         summary_rows.append(
             {
                 "scenario": scenario,
@@ -51,6 +56,8 @@ def _load_results(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str,
                 "bias_leakage_r2": full_test.get("bias_leakage_r2", np.nan),
                 "domain_leakage_r2": full_test.get("domain_leakage_r2", np.nan),
                 "gate_f1": gate_metrics.get("gate_f1", np.nan),
+                "core_graph_f1": graph_metrics.get("graph_f1", np.nan),
+                "core_graph_active": graph_metrics.get("graph_active", np.nan),
             }
         )
 
@@ -61,6 +68,9 @@ def _load_results(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str,
 
         gates.setdefault(scenario, []).append(np.asarray(corerank["final_gates"], dtype=float))
         true_fp.setdefault(scenario, np.asarray(corerank["true_footprint"], dtype=float))
+        if "learned_core_graph" in corerank and "true_core_graph" in corerank:
+            core_graphs.setdefault(scenario, []).append(np.asarray(corerank["learned_core_graph"], dtype=float))
+            true_core_graph.setdefault(scenario, np.asarray(corerank["true_core_graph"], dtype=float))
 
     if not summary_rows:
         raise RuntimeError(f"No complete result runs found under {base_dir}")
@@ -68,7 +78,8 @@ def _load_results(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str,
     summary_df = pd.DataFrame(summary_rows).sort_values(["scenario", "seed"])
     subset_df = pd.concat(subset_rows, ignore_index=True)
     mean_gates = {scenario: np.stack(vals).mean(axis=0) for scenario, vals in gates.items()}
-    return summary_df, subset_df, mean_gates, true_fp
+    mean_core_graphs = {scenario: np.stack(vals).mean(axis=0) for scenario, vals in core_graphs.items()}
+    return summary_df, subset_df, mean_gates, true_fp, mean_core_graphs, true_core_graph
 
 
 def _mean_sem(df: pd.DataFrame, group_cols: list[str], value: str) -> pd.DataFrame:
@@ -90,7 +101,7 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
         }
     )
 
-    summary_df, subset_df, mean_gates, true_fp = _load_results(base_dir)
+    summary_df, subset_df, mean_gates, true_fp, mean_core_graphs, true_core_graph = _load_results(base_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_df.to_csv(out_dir / "full_test_summary.csv", index=False)
     subset_df.to_csv(out_dir / "all_subset_metrics.csv", index=False)
@@ -237,6 +248,31 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
     fig.colorbar(im, ax=axes, shrink=0.75, label="Gate value")
     fig.savefig(out_dir / "gate_heatmaps.png")
     plt.close(fig)
+
+    if mean_core_graphs:
+        graph_scenarios = [s for s in scenarios if s in mean_core_graphs and s in true_core_graph]
+        fig, axes = plt.subplots(len(graph_scenarios), 2, figsize=(7.8, 8.4), constrained_layout=True)
+        axes = np.atleast_2d(axes)
+        vmax = max(float(np.max(np.abs(mean_core_graphs[s]))) for s in graph_scenarios)
+        vmax = max(vmax, 0.05)
+        for row, scenario in enumerate(graph_scenarios):
+            for col, (title, mat) in enumerate([
+                ("Learned mean core graph", mean_core_graphs[scenario]),
+                ("True core graph", true_core_graph[scenario]),
+            ]):
+                ax = axes[row, col]
+                im = ax.imshow(mat, vmin=-vmax, vmax=vmax, cmap="coolwarm", aspect="equal")
+                ax.set_title(f"{scenario_labels[scenario]}: {title}")
+                ax.set_xlabel("Parent core dimension")
+                ax.set_ylabel("Child core dimension")
+                ax.set_xticks(range(mat.shape[1]))
+                ax.set_yticks(range(mat.shape[0]))
+                for i in range(mat.shape[0]):
+                    for j in range(mat.shape[1]):
+                        ax.text(j, i, f"{mat[i, j]:.2f}", ha="center", va="center", fontsize=7)
+        fig.colorbar(im, ax=axes, shrink=0.75, label="Directed effect")
+        fig.savefig(out_dir / "core_graph_heatmaps.png")
+        plt.close(fig)
 
 
 def main() -> None:

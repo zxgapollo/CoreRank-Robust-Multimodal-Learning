@@ -66,6 +66,14 @@ G[m, j] = 1  iff modality m contains recoverable evidence about disease-core coo
 
 This is different from an internal causal graph among disease factors.
 
+The current implementation also includes an optional **core structural graph** learner:
+
+```text
+Z_j <- sum_k A[j, k] Z_k + E_j
+```
+
+It uses a NOTEARS-style acyclicity penalty and graph sparsity penalty. This should be presented as learning a soft structural prior over the recovered core coordinates, not as proof of full causal identification from observational data.
+
 ### 2.4 Core variables are not all modality-causing variables
 
 The disease core is a minimal task-relevant latent block, not a bucket containing every variable that affects a modality. Variables such as age, sex, gene status, scanner/site, acquisition protocol, and visit timing may affect a modality or even affect an intermediate cognitive measurement, but they should not automatically become part of the disease core.
@@ -274,8 +282,14 @@ J = -L_ELBO
     + lambda_rank * relu(kappa - c_rank)
     + 0.5 * rho_rank * relu(kappa - c_rank)^2
     + lambda_sparse * relu(Omega(G) - s)
-    + 0.5 * rho_sparse * relu(Omega(G) - s)^2.
+    + 0.5 * rho_sparse * relu(Omega(G) - s)^2
+    + alpha_struct ||Z - A Z||^2
+    + alpha_dag h(A)^2
+    + alpha_A ||A||_1
+    + alpha_ctx Corr(Z, C)^2.
 ```
+
+The context-invariance term is optional and is only applied when known non-core context variables are available, such as synthetic bias variables, site/domain indicators, age, scanner, or visit timing. It encodes the claim that these variables may affect modalities but should not become disease-core coordinates.
 
 Dual variables are updated during training:
 
@@ -488,11 +502,13 @@ The current code implements:
 9. true-generator Fisher/rank diagnostics for the synthetic benchmark;
 10. bias/domain leakage probes from learned `z_hat`;
 11. temperature annealing and binary pressure options for soft footprint gates;
-12. metrics and CSV/JSON output.
+12. optional core structural graph learning with acyclicity and sparsity penalties;
+13. optional context-invariance penalties for known non-core variables;
+14. metrics and CSV/JSON output.
 
 The first code drop does **not** implement:
 
-1. learning the internal disease-core DAG `A`;
+1. proving global identifiability of the internal disease-core DAG `A`;
 2. real medical datasets;
 3. joint Fisher for shared nuisance;
 4. hard-concrete gates;

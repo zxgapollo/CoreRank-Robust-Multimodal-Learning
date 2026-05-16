@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from .data import SyntheticConfig, SyntheticDataset, SyntheticParams, SyntheticSplit, collate_batch, true_fisher_for_split
 from .fisher import batch_core_information, rank_score_from_K
-from .metrics import binary_metrics, footprint_metrics, linear_probe_r2, mean_corrcoef_matching, ridge_r2
+from .metrics import binary_metrics, directed_graph_metrics, footprint_metrics, linear_probe_r2, mean_corrcoef_matching, ridge_r2
 from .models import CoreRankVAE, EarlyFusionClassifier, ModelConfig, kl_standard_normal
 
 
@@ -29,7 +29,14 @@ class TrainConfig:
     beta_z: float = 1e-3
     beta_u: float = 1e-3
     recon_weight: float = 1.0
+    recon_reduction: str = "mean"
     label_weight: float = 1.0
+    structural_weight: float = 0.05
+    dag_weight: float = 0.1
+    graph_l1_weight: float = 0.01
+    structural_warmup_epochs: int = 0
+    bias_invariance_weight: float = 0.0
+    domain_invariance_weight: float = 0.0
     rank_kappa: float = 0.5
     sparse_budget: float = 9.0
     rho_rank: float = 1.0
@@ -54,6 +61,7 @@ class TrainConfig:
     gate_anneal_epochs: int = 0
     gate_l1_weight: float = 0.0
     gate_binary_weight: float = 0.0
+    structural_classifier: bool = True
 
 
 def _set_seed(seed: int) -> None:
@@ -88,6 +96,19 @@ def _to_device(batch: Dict, device: str) -> Dict:
     }
 
 
+def _standardize_batch(x: torch.Tensor) -> torch.Tensor:
+    return (x - x.mean(dim=0, keepdim=True)) / x.std(dim=0, keepdim=True).clamp_min(1e-5)
+
+
+def _linear_invariance_penalty(z: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if z.shape[0] < 2:
+        return torch.tensor(0.0, device=z.device)
+    z0 = _standardize_batch(z)
+    t0 = _standardize_batch(target)
+    corr = z0.T @ t0 / max(1, z.shape[0] - 1)
+    return corr.pow(2).mean()
+
+
 def _vae_step_losses(
     model: CoreRankVAE,
     batch: Dict,
@@ -98,7 +119,13 @@ def _vae_step_losses(
     sigma2 = model.cfg.decoder_noise_std ** 2
     recon_loss = torch.tensor(0.0, device=batch["y"].device)
     for m, rec in enumerate(out["recon"]):
-        mse_m = F.mse_loss(rec, batch["x"][m], reduction="none").sum(dim=-1)
+        mse_raw = F.mse_loss(rec, batch["x"][m], reduction="none")
+        if tcfg.recon_reduction == "sum":
+            mse_m = mse_raw.sum(dim=-1)
+        elif tcfg.recon_reduction == "mean":
+            mse_m = mse_raw.mean(dim=-1)
+        else:
+            raise ValueError(f"Unknown recon_reduction={tcfg.recon_reduction!r}")
         recon_loss = recon_loss + (obs_mask[:, m] * 0.5 * mse_m / sigma2).mean()
     label_loss = F.binary_cross_entropy_with_logits(out["logits"], batch["y"], reduction="mean")
     kl_z = kl_standard_normal(out["z_mu"], out["z_logvar"]).mean()
@@ -141,6 +168,7 @@ def train_corerank(
         gate_temperature=tcfg.gate_temperature,
         init_gate_logit=tcfg.init_gate_logit,
         decoder_noise_std=scfg.noise_std,
+        structural_classifier=tcfg.structural_classifier,
     )
     model = CoreRankVAE(model_cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
@@ -162,6 +190,7 @@ def train_corerank(
         epoch_logs: Dict[str, List[float]] = {}
         rank_active = (epoch + 1) > tcfg.rank_warmup_epochs and not tcfg.no_rank
         sparse_active = (epoch + 1) > tcfg.sparse_warmup_epochs and not tcfg.no_sparse
+        structural_active = (epoch + 1) > tcfg.structural_warmup_epochs
 
         for batch0 in pbar:
             batch = _to_device(batch0, device)
@@ -169,6 +198,28 @@ def train_corerank(
             opt.zero_grad(set_to_none=True)
             nll, logs, out = _vae_step_losses(model, batch, obs_mask, tcfg)
             loss = nll
+
+            structural_z = _standardize_batch(out["z_mu"])
+            structural_loss = 0.5 * model.core_graph.residual(structural_z).pow(2).mean()
+            dag_penalty = model.core_graph.acyclicity()
+            graph_l1 = model.core_graph.l1()
+            bias_invariance = torch.tensor(0.0, device=device)
+            if scfg.bias_strength > 0 and tcfg.bias_invariance_weight > 0:
+                bias_invariance = _linear_invariance_penalty(out["z_mu"], batch["bias"][scfg.biased_modality])
+            domain_invariance = torch.tensor(0.0, device=device)
+            if scfg.domain_shift_strength > 0 and tcfg.domain_invariance_weight > 0:
+                domain_invariance = _linear_invariance_penalty(out["z_mu"], batch["domain"])
+            if structural_active:
+                if tcfg.structural_weight > 0:
+                    loss = loss + tcfg.structural_weight * structural_loss
+                if tcfg.dag_weight > 0:
+                    loss = loss + tcfg.dag_weight * dag_penalty.pow(2)
+                if tcfg.graph_l1_weight > 0:
+                    loss = loss + tcfg.graph_l1_weight * graph_l1
+            if tcfg.bias_invariance_weight > 0:
+                loss = loss + tcfg.bias_invariance_weight * bias_invariance
+            if tcfg.domain_invariance_weight > 0:
+                loss = loss + tcfg.domain_invariance_weight * domain_invariance
 
             rank_score = torch.tensor(0.0, device=device)
             rank_violation = torch.tensor(0.0, device=device)
@@ -211,6 +262,11 @@ def train_corerank(
                 "loss": float(loss.detach().cpu()),
                 "rank_score": float(rank_score.detach().cpu()),
                 "rank_violation": float(rank_violation.detach().cpu()),
+                "structural_loss": float(structural_loss.detach().cpu()),
+                "dag_penalty": float(dag_penalty.detach().cpu()),
+                "graph_l1": float(graph_l1.detach().cpu()),
+                "bias_invariance": float(bias_invariance.detach().cpu()),
+                "domain_invariance": float(domain_invariance.detach().cpu()),
                 "omega_g": float(omega.detach().cpu()),
                 "gate_l1": float(gate_l1.detach().cpu()),
                 "gate_binary": float(gate_binary.detach().cpu()),
@@ -221,7 +277,12 @@ def train_corerank(
             }
             for k, v in step_logs.items():
                 epoch_logs.setdefault(k, []).append(v)
-            pbar.set_postfix({"loss": step_logs["loss"], "rank": step_logs["rank_score"], "G": step_logs["omega_g"]})
+            pbar.set_postfix({
+                "loss": step_logs["loss"],
+                "rank": step_logs["rank_score"],
+                "G": step_logs["omega_g"],
+                "dag": step_logs["dag_penalty"],
+            })
 
         summary = {k: float(np.mean(v)) for k, v in epoch_logs.items()}
         summary["epoch"] = epoch + 1
@@ -232,10 +293,15 @@ def train_corerank(
     metrics["train_history"] = history
     metrics["gates"] = model.gates().detach().cpu().numpy().tolist()
     metrics["true_footprint"] = params.footprint.tolist()
+    learned_core_graph = model.core_graph.adjacency().detach().cpu().numpy()
+    metrics["learned_core_graph"] = learned_core_graph.tolist()
+    metrics["true_core_graph"] = params.core_graph.tolist()
 
     torch.save(model.state_dict(), os.path.join(output_dir, "model.pt"))
     np.save(os.path.join(output_dir, "gates.npy"), model.gates().detach().cpu().numpy())
     np.save(os.path.join(output_dir, "true_footprint.npy"), params.footprint)
+    np.save(os.path.join(output_dir, "learned_core_graph.npy"), learned_core_graph)
+    np.save(os.path.join(output_dir, "true_core_graph.npy"), params.core_graph)
     pd.DataFrame(history).to_csv(os.path.join(output_dir, "train_history.csv"), index=False)
     with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
@@ -372,10 +438,15 @@ def evaluate_model(
     subset_df = pd.DataFrame(all_rows)
 
     gates = model.gates().detach().cpu().numpy()
+    learned_core_graph = model.core_graph.adjacency().detach().cpu().numpy()
     gate_metrics = footprint_metrics(gates, params.footprint)
+    graph_metrics = directed_graph_metrics(learned_core_graph, params.core_graph)
     main = {
         "gate_metrics": gate_metrics,
+        "graph_metrics": graph_metrics,
         "final_gates": gates.tolist(),
+        "learned_core_graph": learned_core_graph.tolist(),
+        "true_core_graph": params.core_graph.tolist(),
         "full_test": subset_df[(subset_df.split == "test") & (subset_df.subset_size == scfg.n_modalities)].iloc[0].to_dict(),
     }
     return main, subset_df

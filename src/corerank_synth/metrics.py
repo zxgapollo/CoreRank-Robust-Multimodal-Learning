@@ -96,5 +96,34 @@ def footprint_metrics(gate: np.ndarray, true_fp: np.ndarray, threshold: float = 
     }
 
 
+def directed_graph_metrics(weight: np.ndarray, true_graph: np.ndarray, threshold: float = 0.05) -> Dict[str, float]:
+    pred = (np.abs(weight) >= threshold).astype(int)
+    true = (np.abs(true_graph) > 1e-8).astype(int)
+    offdiag = 1 - np.eye(true.shape[0], dtype=int)
+    pred = pred * offdiag
+    true = true * offdiag
+    tp = int(((pred == 1) & (true == 1)).sum())
+    fp = int(((pred == 1) & (true == 0)).sum())
+    fn = int(((pred == 0) & (true == 1)).sum())
+    tn = int(((pred == 0) & (true == 0)).sum())
+    precision = tp / max(1, tp + fp)
+    recall = tp / max(1, tp + fn)
+    f1 = 2 * precision * recall / max(1e-12, precision + recall)
+    acc = (tp + tn) / max(1, tp + fp + fn + tn)
+    true_edge_mask = true.astype(bool)
+    if true_edge_mask.any():
+        sign_acc = float((np.sign(weight[true_edge_mask]) == np.sign(true_graph[true_edge_mask])).mean())
+    else:
+        sign_acc = float("nan")
+    return {
+        "graph_precision": float(precision),
+        "graph_recall": float(recall),
+        "graph_f1": float(f1),
+        "graph_accuracy": float(acc),
+        "graph_active": float(pred.sum()),
+        "graph_sign_accuracy": sign_acc,
+    }
+
+
 def linear_probe_r2(x: np.ndarray, target: np.ndarray) -> float:
     return ridge_r2(x, target)

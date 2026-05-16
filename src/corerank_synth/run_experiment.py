@@ -37,7 +37,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--beta-z", type=float, default=1e-3)
     p.add_argument("--beta-u", type=float, default=1e-3)
     p.add_argument("--recon-weight", type=float, default=1.0)
+    p.add_argument("--recon-reduction", type=str, default="mean", choices=["mean", "sum"])
     p.add_argument("--label-weight", type=float, default=1.0)
+    p.add_argument("--structural-weight", type=float, default=0.05)
+    p.add_argument("--dag-weight", type=float, default=0.1)
+    p.add_argument("--graph-l1-weight", type=float, default=0.01)
+    p.add_argument("--structural-warmup-epochs", type=int, default=0)
+    p.add_argument("--bias-invariance-weight", type=float, default=0.0)
+    p.add_argument("--domain-invariance-weight", type=float, default=0.0)
     p.add_argument("--rank-kappa", type=float, default=0.5)
     p.add_argument("--sparse-budget", type=float, default=9.0)
     p.add_argument("--rho-rank", type=float, default=1.0)
@@ -59,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gate-anneal-epochs", type=int, default=0)
     p.add_argument("--gate-l1-weight", type=float, default=0.0)
     p.add_argument("--gate-binary-weight", type=float, default=0.0)
+    p.add_argument("--no-structural-classifier", action="store_true")
     p.add_argument("--no-rank", action="store_true")
     p.add_argument("--no-sparse", action="store_true")
     p.add_argument("--skip-erm", action="store_true")
@@ -107,7 +115,14 @@ def main() -> None:
         beta_z=args.beta_z,
         beta_u=args.beta_u,
         recon_weight=args.recon_weight,
+        recon_reduction=args.recon_reduction,
         label_weight=args.label_weight,
+        structural_weight=args.structural_weight,
+        dag_weight=args.dag_weight,
+        graph_l1_weight=args.graph_l1_weight,
+        structural_warmup_epochs=args.structural_warmup_epochs,
+        bias_invariance_weight=args.bias_invariance_weight,
+        domain_invariance_weight=args.domain_invariance_weight,
         rank_kappa=args.rank_kappa,
         sparse_budget=args.sparse_budget,
         rho_rank=args.rho_rank,
@@ -132,6 +147,7 @@ def main() -> None:
         gate_anneal_epochs=args.gate_anneal_epochs,
         gate_l1_weight=args.gate_l1_weight,
         gate_binary_weight=args.gate_binary_weight,
+        structural_classifier=not args.no_structural_classifier,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)

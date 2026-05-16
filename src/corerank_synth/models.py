@@ -20,6 +20,7 @@ class ModelConfig:
     gate_temperature: float = 0.67
     init_gate_logit: float = 0.0
     decoder_noise_std: float = 0.35
+    structural_classifier: bool = True
 
 
 def make_mlp(in_dim: int, out_dim: int, hidden_dim: int, layers: int, final_activation: Optional[str] = None) -> nn.Sequential:
@@ -74,6 +75,36 @@ class SoftFootprintGates(nn.Module):
         return self.forward().sum()
 
 
+class CoreStructuralGraph(nn.Module):
+    """Learn a directed graph among core coordinates.
+
+    The graph is used as a soft linear SEM, z_j <- sum_k A[j, k] z_k + e_j.
+    Acyclicity is encouraged in the training objective; the module itself only
+    enforces a zero diagonal.
+    """
+
+    def __init__(self, z_dim: int, init_scale: float = 0.02):
+        super().__init__()
+        self.weight = nn.Parameter(init_scale * torch.randn(z_dim, z_dim))
+        self.register_buffer("offdiag_mask", torch.ones(z_dim, z_dim) - torch.eye(z_dim))
+
+    def adjacency(self) -> torch.Tensor:
+        return self.weight * self.offdiag_mask
+
+    def predict(self, z: torch.Tensor) -> torch.Tensor:
+        return z @ self.adjacency().T
+
+    def residual(self, z: torch.Tensor) -> torch.Tensor:
+        return z - self.predict(z)
+
+    def acyclicity(self) -> torch.Tensor:
+        graph = self.adjacency()
+        return torch.trace(torch.matrix_exp(graph * graph)) - graph.shape[0]
+
+    def l1(self) -> torch.Tensor:
+        return self.adjacency().abs().mean()
+
+
 class CoreRankVAE(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -87,7 +118,9 @@ class CoreRankVAE(nn.Module):
             for _ in range(cfg.n_modalities)
         ])
         self.gates = SoftFootprintGates(cfg.n_modalities, cfg.z_dim, cfg.init_gate_logit, cfg.gate_temperature)
-        self.classifier = make_mlp(cfg.z_dim, 1, cfg.hidden_dim, 2)
+        self.core_graph = CoreStructuralGraph(cfg.z_dim)
+        classifier_in = cfg.z_dim * 3 if cfg.structural_classifier else cfg.z_dim
+        self.classifier = make_mlp(classifier_in, 1, cfg.hidden_dim, 2)
 
     def encode(self, xs: List[torch.Tensor], obs_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """Return q(z|x_O) mean/logvar and per-modality q(u_m|x_m) params.
@@ -128,12 +161,21 @@ class CoreRankVAE(nn.Module):
             recons.append(dec(g[m].unsqueeze(0) * z, us[m]))
         return recons
 
+    def core_features(self, z: torch.Tensor) -> torch.Tensor:
+        if not self.cfg.structural_classifier:
+            return z
+        structural_pred = self.core_graph.predict(z)
+        structural_resid = z - structural_pred
+        return torch.cat([z, structural_pred, structural_resid], dim=-1)
+
     def forward(self, xs: List[torch.Tensor], obs_mask: torch.Tensor, sample: bool = True) -> dict:
         z_mu, z_logvar, u_mus, u_logvars = self.encode(xs, obs_mask)
         z = self.reparameterize(z_mu, z_logvar, sample=sample)
         us = [self.reparameterize(mu, lv, sample=sample) for mu, lv in zip(u_mus, u_logvars)]
         recons = self.decode(z, us)
-        logits = self.classifier(z)
+        structural_pred = self.core_graph.predict(z_mu)
+        structural_resid = z_mu - structural_pred
+        logits = self.classifier(self.core_features(z))
         return {
             "z": z,
             "z_mu": z_mu,
@@ -143,6 +185,8 @@ class CoreRankVAE(nn.Module):
             "u_logvar": u_logvars,
             "recon": recons,
             "logits": logits,
+            "structural_pred": structural_pred,
+            "structural_resid": structural_resid,
         }
 
 
