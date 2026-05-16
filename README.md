@@ -10,7 +10,7 @@ The core idea is sound as a synthetic-testable claim if stated locally:
 
 > A modality is useful for robust prediction when it adds nuisance-adjusted Fisher directions for the recoverable disease-core block.
 
-The benchmark is not claiming global causal graph identification. It tests local disease-core recoverability, sparse modality-to-core footprint recovery, missing-modality behavior, robustness under a controlled spurious-bias shift, robustness under a controlled domain/mechanism shift, and an optional learned structural graph among recovered core coordinates.
+The benchmark is not claiming global causal graph identification. It tests local disease-core recoverability, sparse modality-to-core footprint recovery, missing-modality behavior, robustness under a controlled spurious-bias shift, robustness under a controlled domain/mechanism shift, and a structural innovation parameterization over recovered core coordinates.
 
 ## Quick start
 
@@ -21,7 +21,7 @@ pip install -e ".[dev]"
 python -m corerank_synth.run_experiment --scenario complementary --n-train 512 --n-val 256 --n-test 256 --epochs 3 --batch-size 128 --output-dir outputs/smoke
 ```
 
-The current training default uses dimension-normalized reconstruction loss plus a soft structural graph prior. Farm scripts also add context-invariance penalties for known synthetic bias/domain variables. Use `--recon-reduction sum --structural-weight 0` to reproduce the earlier reconstruction-heavy baseline.
+The current training default uses dimension-normalized reconstruction loss, an SEM innovation prior `E = (I - A)Z - Gamma C`, and a classifier on innovation coordinates. Farm scripts also add context-invariance penalties for known synthetic bias/domain variables and select the best checkpoint by predictive sufficiency first, then lower context leakage. Use `--recon-reduction sum --no-sem-prior` to reproduce the earlier reconstruction-heavy baseline family.
 
 Run tests:
 

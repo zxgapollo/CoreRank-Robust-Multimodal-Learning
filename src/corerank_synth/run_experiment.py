@@ -39,12 +39,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--recon-weight", type=float, default=1.0)
     p.add_argument("--recon-reduction", type=str, default="mean", choices=["mean", "sum"])
     p.add_argument("--label-weight", type=float, default=1.0)
-    p.add_argument("--structural-weight", type=float, default=0.05)
+    p.add_argument("--structural-weight", type=float, default=0.0)
     p.add_argument("--dag-weight", type=float, default=0.1)
     p.add_argument("--graph-l1-weight", type=float, default=0.01)
     p.add_argument("--structural-warmup-epochs", type=int, default=0)
     p.add_argument("--bias-invariance-weight", type=float, default=0.0)
     p.add_argument("--domain-invariance-weight", type=float, default=0.0)
+    p.add_argument("--no-sem-prior", action="store_true")
+    p.add_argument("--rank-on-z", action="store_true")
+    p.add_argument("--no-select-best", action="store_true")
+    p.add_argument("--best-id-tolerance", type=float, default=0.02)
+    p.add_argument("--best-leakage-weight", type=float, default=0.0)
     p.add_argument("--rank-kappa", type=float, default=0.5)
     p.add_argument("--sparse-budget", type=float, default=9.0)
     p.add_argument("--rho-rank", type=float, default=1.0)
@@ -123,6 +128,11 @@ def main() -> None:
         structural_warmup_epochs=args.structural_warmup_epochs,
         bias_invariance_weight=args.bias_invariance_weight,
         domain_invariance_weight=args.domain_invariance_weight,
+        use_sem_prior=not args.no_sem_prior,
+        rank_on_innovation=not args.rank_on_z,
+        select_best=not args.no_select_best,
+        best_id_tolerance=args.best_id_tolerance,
+        best_leakage_weight=args.best_leakage_weight,
         rank_kappa=args.rank_kappa,
         sparse_budget=args.sparse_budget,
         rho_rank=args.rho_rank,
@@ -154,11 +164,11 @@ def main() -> None:
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
         json.dump({"synthetic": scfg.to_dict(), "train": asdict(tcfg)}, f, indent=2)
 
-    train, val, test, params = make_synthetic_data(scfg)
-    model, metrics, subset_df = train_corerank(train, val, test, params, scfg, tcfg, args.output_dir)
+    train, val, id_test, test, params = make_synthetic_data(scfg, include_id_test=True)
+    model, metrics, subset_df = train_corerank(train, val, test, params, scfg, tcfg, args.output_dir, id_test=id_test)
     result = {"corerank": metrics}
     if not args.skip_erm:
-        erm_metrics = train_erm_baseline(train, val, test, scfg, tcfg, args.output_dir, epochs=max(3, min(args.epochs, 30)))
+        erm_metrics = train_erm_baseline(train, val, test, scfg, tcfg, args.output_dir, epochs=max(3, min(args.epochs, 30)), id_test=id_test)
         result["erm"] = erm_metrics
     with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
         json.dump(result, f, indent=2)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -16,7 +17,7 @@ from tqdm import tqdm
 from .data import SyntheticConfig, SyntheticDataset, SyntheticParams, SyntheticSplit, collate_batch, true_fisher_for_split
 from .fisher import batch_core_information, rank_score_from_K
 from .metrics import binary_metrics, directed_graph_metrics, footprint_metrics, linear_probe_r2, mean_corrcoef_matching, ridge_r2
-from .models import CoreRankVAE, EarlyFusionClassifier, ModelConfig, kl_standard_normal
+from .models import CoreRankVAE, EarlyFusionClassifier, ModelConfig, kl_sem_normal, kl_standard_normal
 
 
 @dataclass
@@ -31,12 +32,17 @@ class TrainConfig:
     recon_weight: float = 1.0
     recon_reduction: str = "mean"
     label_weight: float = 1.0
-    structural_weight: float = 0.05
+    structural_weight: float = 0.0
     dag_weight: float = 0.1
     graph_l1_weight: float = 0.01
     structural_warmup_epochs: int = 0
     bias_invariance_weight: float = 0.0
     domain_invariance_weight: float = 0.0
+    use_sem_prior: bool = True
+    rank_on_innovation: bool = True
+    select_best: bool = True
+    best_id_tolerance: float = 0.02
+    best_leakage_weight: float = 0.0
     rank_kappa: float = 0.5
     sparse_budget: float = 9.0
     rho_rank: float = 1.0
@@ -96,6 +102,10 @@ def _to_device(batch: Dict, device: str) -> Dict:
     }
 
 
+def _make_context(batch: Dict, scfg: SyntheticConfig) -> torch.Tensor:
+    return torch.cat([batch["bias"][scfg.biased_modality], batch["domain"]], dim=-1)
+
+
 def _standardize_batch(x: torch.Tensor) -> torch.Tensor:
     return (x - x.mean(dim=0, keepdim=True)) / x.std(dim=0, keepdim=True).clamp_min(1e-5)
 
@@ -113,9 +123,10 @@ def _vae_step_losses(
     model: CoreRankVAE,
     batch: Dict,
     obs_mask: torch.Tensor,
+    context: torch.Tensor,
     tcfg: TrainConfig,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict]:
-    out = model(batch["x"], obs_mask, sample=True)
+    out = model(batch["x"], obs_mask, context=context, sample=True)
     sigma2 = model.cfg.decoder_noise_std ** 2
     recon_loss = torch.tensor(0.0, device=batch["y"].device)
     for m, rec in enumerate(out["recon"]):
@@ -128,7 +139,10 @@ def _vae_step_losses(
             raise ValueError(f"Unknown recon_reduction={tcfg.recon_reduction!r}")
         recon_loss = recon_loss + (obs_mask[:, m] * 0.5 * mse_m / sigma2).mean()
     label_loss = F.binary_cross_entropy_with_logits(out["logits"], batch["y"], reduction="mean")
-    kl_z = kl_standard_normal(out["z_mu"], out["z_logvar"]).mean()
+    if tcfg.use_sem_prior:
+        kl_z = kl_sem_normal(out["z_mu"], out["z_logvar"], model.core_graph, context).mean()
+    else:
+        kl_z = kl_standard_normal(out["z_mu"], out["z_logvar"]).mean()
     kl_u = torch.tensor(0.0, device=batch["y"].device)
     for m in range(model.cfg.n_modalities):
         kl_u_m = kl_standard_normal(out["u_mu"][m], out["u_logvar"][m])
@@ -152,6 +166,7 @@ def train_corerank(
     scfg: SyntheticConfig,
     tcfg: TrainConfig,
     output_dir: str,
+    id_test: Optional[SyntheticSplit] = None,
 ) -> Tuple[CoreRankVAE, Dict, pd.DataFrame]:
     _set_seed(tcfg.seed)
     os.makedirs(output_dir, exist_ok=True)
@@ -168,6 +183,7 @@ def train_corerank(
         gate_temperature=tcfg.gate_temperature,
         init_gate_logit=tcfg.init_gate_logit,
         decoder_noise_std=scfg.noise_std,
+        context_dim=2,
         structural_classifier=tcfg.structural_classifier,
     )
     model = CoreRankVAE(model_cfg).to(device)
@@ -178,6 +194,7 @@ def train_corerank(
     lambda_rank = torch.tensor(0.0, device=device)
     lambda_sparse = torch.tensor(0.0, device=device)
     history = []
+    checkpoint_candidates = []
 
     for epoch in range(tcfg.epochs):
         model.train()
@@ -194,21 +211,23 @@ def train_corerank(
 
         for batch0 in pbar:
             batch = _to_device(batch0, device)
+            context = _make_context(batch, scfg)
             obs_mask = _make_obs_mask(batch["y"].shape[0], scfg.n_modalities, device, tcfg.modality_dropout)
             opt.zero_grad(set_to_none=True)
-            nll, logs, out = _vae_step_losses(model, batch, obs_mask, tcfg)
+            nll, logs, out = _vae_step_losses(model, batch, obs_mask, context, tcfg)
             loss = nll
 
             structural_z = _standardize_batch(out["z_mu"])
-            structural_loss = 0.5 * model.core_graph.residual(structural_z).pow(2).mean()
+            structural_context = _standardize_batch(context)
+            structural_loss = 0.5 * model.core_graph.innovation(structural_z, structural_context).pow(2).mean()
             dag_penalty = model.core_graph.acyclicity()
             graph_l1 = model.core_graph.l1()
             bias_invariance = torch.tensor(0.0, device=device)
             if scfg.bias_strength > 0 and tcfg.bias_invariance_weight > 0:
-                bias_invariance = _linear_invariance_penalty(out["z_mu"], batch["bias"][scfg.biased_modality])
+                bias_invariance = _linear_invariance_penalty(out["innovation_mu"], batch["bias"][scfg.biased_modality])
             domain_invariance = torch.tensor(0.0, device=device)
             if scfg.domain_shift_strength > 0 and tcfg.domain_invariance_weight > 0:
-                domain_invariance = _linear_invariance_penalty(out["z_mu"], batch["domain"])
+                domain_invariance = _linear_invariance_penalty(out["innovation_mu"], batch["domain"])
             if structural_active:
                 if tcfg.structural_weight > 0:
                     loss = loss + tcfg.structural_weight * structural_loss
@@ -230,6 +249,8 @@ def train_corerank(
                     damping=tcfg.fisher_damping,
                     max_fisher_batch=tcfg.max_fisher_batch,
                 )
+                if tcfg.rank_on_innovation:
+                    K = model.core_graph.transform_information_to_innovation(K)
                 rank_score, _ = rank_score_from_K(K, eps=tcfg.rank_eps)
                 rank_violation = F.relu(torch.tensor(tcfg.rank_kappa, device=device) - rank_score)
                 loss = loss + lambda_rank.detach() * rank_violation + 0.5 * tcfg.rho_rank * rank_violation.pow(2)
@@ -286,10 +307,53 @@ def train_corerank(
 
         summary = {k: float(np.mean(v)) for k, v in epoch_logs.items()}
         summary["epoch"] = epoch + 1
+        if tcfg.select_best:
+            val_metrics = _quick_prediction_metrics(model, val, scfg, tcfg, tuple(range(scfg.n_modalities)))
+            summary["val_full_auroc"] = val_metrics["auroc"]
+            summary["val_full_accuracy"] = val_metrics["accuracy"]
+            summary["val_context_leakage_r2"] = val_metrics["context_leakage_r2"]
+            summary["val_robust_score"] = val_metrics["robust_score"]
+            if np.isfinite(val_metrics["auroc"]):
+                checkpoint_candidates.append({
+                    "epoch": epoch + 1,
+                    "state": deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()}),
+                    "val_auroc": float(val_metrics["auroc"]),
+                    "val_accuracy": float(val_metrics["accuracy"]),
+                    "val_context_leakage_r2": float(val_metrics["context_leakage_r2"]),
+                    "val_robust_score": float(val_metrics["robust_score"]),
+                })
         history.append(summary)
 
     # Evaluation.
-    metrics, subset_df = evaluate_model(model, train, val, test, params, scfg, tcfg)
+    best_summary = None
+    best_val_auc = float("nan")
+    best_val_auc_floor = float("nan")
+    if tcfg.select_best and checkpoint_candidates:
+        best_val_auc = max(c["val_auroc"] for c in checkpoint_candidates)
+        best_val_auc_floor = best_val_auc - max(0.0, tcfg.best_id_tolerance)
+        feasible = [c for c in checkpoint_candidates if c["val_auroc"] >= best_val_auc_floor]
+        if not feasible:
+            feasible = checkpoint_candidates
+        if tcfg.best_leakage_weight > 0:
+            best_summary = max(
+                feasible,
+                key=lambda c: (c["val_robust_score"], c["val_auroc"], -c["val_context_leakage_r2"]),
+            )
+        else:
+            best_summary = max(
+                feasible,
+                key=lambda c: (c["val_auroc"], -c["val_context_leakage_r2"]),
+            )
+        model.load_state_dict(best_summary["state"])
+    metrics, subset_df = evaluate_model(model, train, val, test, params, scfg, tcfg, id_test=id_test)
+    metrics["best_epoch"] = int(best_summary["epoch"]) if best_summary is not None else 0
+    metrics["best_val_auroc"] = float(best_summary["val_auroc"]) if best_summary is not None else float("nan")
+    metrics["best_val_accuracy"] = float(best_summary["val_accuracy"]) if best_summary is not None else float("nan")
+    metrics["best_val_context_leakage_r2"] = float(best_summary["val_context_leakage_r2"]) if best_summary is not None else float("nan")
+    metrics["best_val_robust_score"] = float(best_summary["val_robust_score"]) if best_summary is not None else float("nan")
+    metrics["best_val_auc_target"] = float(best_val_auc)
+    metrics["best_val_auc_floor"] = float(best_val_auc_floor)
+    metrics["best_id_tolerance"] = float(tcfg.best_id_tolerance)
     metrics["train_history"] = history
     metrics["gates"] = model.gates().detach().cpu().numpy().tolist()
     metrics["true_footprint"] = params.footprint.tolist()
@@ -313,16 +377,18 @@ def train_corerank(
 def _collect_predictions(model: CoreRankVAE, split: SyntheticSplit, scfg: SyntheticConfig, tcfg: TrainConfig, subset: Tuple[int, ...]) -> Dict[str, np.ndarray]:
     device = tcfg.device
     loader = DataLoader(SyntheticDataset(split), batch_size=tcfg.batch_size, shuffle=False, collate_fn=collate_batch)
-    zs, ztrue, probs, ys, biases, domains = [], [], [], [], [], []
+    zs, e_hats, ztrue, probs, ys, biases, domains = [], [], [], [], [], [], []
     obs_template = torch.zeros(scfg.n_modalities, device=device)
     obs_template[list(subset)] = 1.0
     model.eval()
     for batch0 in loader:
         batch = _to_device(batch0, device)
+        context = _make_context(batch, scfg)
         obs_mask = obs_template.unsqueeze(0).expand(batch["y"].shape[0], -1)
-        out = model(batch["x"], obs_mask, sample=False)
+        out = model(batch["x"], obs_mask, context=context, sample=False)
         prob = torch.sigmoid(out["logits"])
         zs.append(out["z_mu"].cpu().numpy())
+        e_hats.append(out["innovation_mu"].cpu().numpy())
         ztrue.append(batch["z"].cpu().numpy())
         probs.append(prob.cpu().numpy())
         ys.append(batch["y"].cpu().numpy())
@@ -330,12 +396,39 @@ def _collect_predictions(model: CoreRankVAE, split: SyntheticSplit, scfg: Synthe
         domains.append(batch["domain"].cpu().numpy())
     return {
         "z_hat": np.concatenate(zs, axis=0),
+        "e_hat": np.concatenate(e_hats, axis=0),
         "z_true": np.concatenate(ztrue, axis=0),
         "prob": np.concatenate(probs, axis=0),
         "y": np.concatenate(ys, axis=0),
         "bias": np.concatenate(biases, axis=0),
         "domain": np.concatenate(domains, axis=0),
     }
+
+
+def _true_innovation(split: SyntheticSplit, params: SyntheticParams) -> np.ndarray:
+    z = split.z.numpy()
+    transform = np.eye(params.core_graph.shape[0], dtype=np.float32) - params.core_graph
+    return (z @ transform.T).astype(np.float32)
+
+
+@torch.no_grad()
+def _quick_prediction_metrics(
+    model: CoreRankVAE,
+    split: SyntheticSplit,
+    scfg: SyntheticConfig,
+    tcfg: TrainConfig,
+    subset: Tuple[int, ...],
+) -> Dict[str, float]:
+    pred = _collect_predictions(model, split, scfg, tcfg, subset)
+    metrics = binary_metrics(pred["y"], pred["prob"])
+    leakage = 0.0
+    if scfg.bias_strength > 0:
+        leakage += linear_probe_r2(pred["e_hat"], pred["bias"][:, [scfg.biased_modality]])
+    if scfg.domain_shift_strength > 0:
+        leakage += linear_probe_r2(pred["e_hat"], pred["domain"])
+    metrics["context_leakage_r2"] = float(leakage)
+    metrics["robust_score"] = float(metrics["auroc"] - tcfg.best_leakage_weight * leakage)
+    return metrics
 
 
 def _estimate_rank_diagnostics(model: CoreRankVAE, split: SyntheticSplit, scfg: SyntheticConfig, tcfg: TrainConfig, subset: Tuple[int, ...]) -> Dict[str, float]:
@@ -351,13 +444,16 @@ def _estimate_rank_diagnostics(model: CoreRankVAE, split: SyntheticSplit, scfg: 
             break
         batch = _to_device(batch0, device)
         obs_mask = obs_template.unsqueeze(0).expand(batch["y"].shape[0], -1)
-        out = model(batch["x"], obs_mask, sample=False)
+        context = _make_context(batch, scfg)
+        out = model(batch["x"], obs_mask, context=context, sample=False)
         K = batch_core_information(
             model, out["z_mu"], out["u_mu"], obs_mask,
             noise_std=scfg.noise_std,
             damping=tcfg.fisher_damping,
             max_fisher_batch=tcfg.max_fisher_batch,
         )
+        if tcfg.rank_on_innovation:
+            K = model.core_graph.transform_information_to_innovation(K)
         score, diag = rank_score_from_K(K, eps=tcfg.rank_eps)
         vals.append({
             "rank_logdet": float(score.detach().cpu()),
@@ -391,6 +487,10 @@ def _estimate_true_rank_diagnostics(
 ) -> Dict[str, float]:
     n = min(tcfg.eval_true_fisher_samples, split.y.shape[0])
     K = true_fisher_for_split(_slice_split(split, n), params, scfg, list(subset))
+    if tcfg.rank_on_innovation:
+        graph = torch.tensor(params.core_graph, dtype=K.dtype)
+        jac = torch.linalg.inv(torch.eye(graph.shape[0], dtype=K.dtype) - graph)
+        K = torch.einsum("ij,bjk,kl->bil", jac.T, K, jac)
     score, diag = rank_score_from_K(K, eps=tcfg.rank_eps)
     return {
         "true_rank_logdet": float(score.detach().cpu()),
@@ -408,9 +508,14 @@ def evaluate_model(
     params: SyntheticParams,
     scfg: SyntheticConfig,
     tcfg: TrainConfig,
+    id_test: Optional[SyntheticSplit] = None,
 ) -> Tuple[Dict, pd.DataFrame]:
     all_rows = []
-    for split_name, split in [("train", train), ("val", val), ("test", test)]:
+    split_items = [("train", train), ("val", val)]
+    if id_test is not None:
+        split_items.append(("id_test", id_test))
+    split_items.append(("test", test))
+    for split_name, split in split_items:
         for k in range(1, scfg.n_modalities + 1):
             for subset in itertools.combinations(range(scfg.n_modalities), k):
                 pred = _collect_predictions(model, split, scfg, tcfg, subset)
@@ -422,15 +527,22 @@ def evaluate_model(
                 row.update(binary_metrics(pred["y"], pred["prob"]))
                 row["latent_r2"] = ridge_r2(pred["z_hat"], pred["z_true"])
                 row["latent_mcc"] = mean_corrcoef_matching(pred["z_hat"], pred["z_true"])
+                true_e = _true_innovation(split, params)
+                row["innovation_r2"] = ridge_r2(pred["e_hat"], true_e)
+                row["innovation_mcc"] = mean_corrcoef_matching(pred["e_hat"], true_e)
                 if scfg.bias_strength > 0:
                     bias_target = pred["bias"][:, [scfg.biased_modality]]
-                    row["bias_leakage_r2"] = linear_probe_r2(pred["z_hat"], bias_target)
+                    row["bias_leakage_r2"] = linear_probe_r2(pred["e_hat"], bias_target)
+                    row["z_bias_leakage_r2"] = linear_probe_r2(pred["z_hat"], bias_target)
                 else:
                     row["bias_leakage_r2"] = float("nan")
+                    row["z_bias_leakage_r2"] = float("nan")
                 if scfg.domain_shift_strength > 0:
-                    row["domain_leakage_r2"] = linear_probe_r2(pred["z_hat"], pred["domain"])
+                    row["domain_leakage_r2"] = linear_probe_r2(pred["e_hat"], pred["domain"])
+                    row["z_domain_leakage_r2"] = linear_probe_r2(pred["z_hat"], pred["domain"])
                 else:
                     row["domain_leakage_r2"] = float("nan")
+                    row["z_domain_leakage_r2"] = float("nan")
                 if split_name in {"val", "test"}:
                     row.update(_estimate_rank_diagnostics(model, split, scfg, tcfg, subset))
                     row.update(_estimate_true_rank_diagnostics(split, params, scfg, tcfg, subset))
@@ -449,6 +561,8 @@ def evaluate_model(
         "true_core_graph": params.core_graph.tolist(),
         "full_test": subset_df[(subset_df.split == "test") & (subset_df.subset_size == scfg.n_modalities)].iloc[0].to_dict(),
     }
+    if id_test is not None:
+        main["id_full_test"] = subset_df[(subset_df.split == "id_test") & (subset_df.subset_size == scfg.n_modalities)].iloc[0].to_dict()
     return main, subset_df
 
 
@@ -460,6 +574,7 @@ def train_erm_baseline(
     tcfg: TrainConfig,
     output_dir: str,
     epochs: Optional[int] = None,
+    id_test: Optional[SyntheticSplit] = None,
 ) -> Dict:
     _set_seed(tcfg.seed + 991)
     device = tcfg.device
@@ -481,7 +596,11 @@ def train_erm_baseline(
     # Evaluate full modality and all subsets.
     rows = []
     model.eval()
-    for split_name, split in [("train", train), ("val", val), ("test", test)]:
+    split_items = [("train", train), ("val", val)]
+    if id_test is not None:
+        split_items.append(("id_test", id_test))
+    split_items.append(("test", test))
+    for split_name, split in split_items:
         loader_eval = DataLoader(SyntheticDataset(split), batch_size=tcfg.batch_size, shuffle=False, collate_fn=collate_batch)
         for k in range(1, scfg.n_modalities + 1):
             for subset in itertools.combinations(range(scfg.n_modalities), k):
@@ -502,4 +621,7 @@ def train_erm_baseline(
     os.makedirs(output_dir, exist_ok=True)
     df.to_csv(os.path.join(output_dir, "erm_subset_metrics.csv"), index=False)
     torch.save(model.state_dict(), os.path.join(output_dir, "erm_model.pt"))
-    return {"erm_full_test": df[(df.split == "test") & (df.subset_size == scfg.n_modalities)].iloc[0].to_dict()}
+    out = {"erm_full_test": df[(df.split == "test") & (df.subset_size == scfg.n_modalities)].iloc[0].to_dict()}
+    if id_test is not None:
+        out["erm_id_full_test"] = df[(df.split == "id_test") & (df.subset_size == scfg.n_modalities)].iloc[0].to_dict()
+    return out

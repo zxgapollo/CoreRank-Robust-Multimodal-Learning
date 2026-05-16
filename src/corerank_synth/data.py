@@ -243,23 +243,29 @@ def _generate_split(n: int, cfg: SyntheticConfig, params: SyntheticParams, split
     )
 
 
-def standardize_splits(train: SyntheticSplit, val: SyntheticSplit, test: SyntheticSplit) -> None:
+def standardize_splits(train: SyntheticSplit, *others: SyntheticSplit) -> None:
     for m in range(len(train.x)):
         mean = train.x[m].mean(dim=0, keepdim=True)
         std = train.x[m].std(dim=0, keepdim=True).clamp_min(1e-5)
         train.x[m] = (train.x[m] - mean) / std
-        val.x[m] = (val.x[m] - mean) / std
-        test.x[m] = (test.x[m] - mean) / std
+        for split in others:
+            split.x[m] = (split.x[m] - mean) / std
 
 
-def make_synthetic_data(cfg: SyntheticConfig) -> Tuple[SyntheticSplit, SyntheticSplit, SyntheticSplit, SyntheticParams]:
+def make_synthetic_data(cfg: SyntheticConfig, include_id_test: bool = False):
     params = _make_params(cfg)
     rng = np.random.default_rng(cfg.seed + 123)
     train = _generate_split(cfg.n_train, cfg, params, "train", rng)
     val = _generate_split(cfg.n_val, cfg, params, "val", rng)
+    id_test = _generate_split(cfg.n_test, cfg, params, "val", rng) if include_id_test else None
     test = _generate_split(cfg.n_test, cfg, params, "test", rng)
     if cfg.standardize:
-        standardize_splits(train, val, test)
+        if id_test is None:
+            standardize_splits(train, val, test)
+        else:
+            standardize_splits(train, val, id_test, test)
+    if include_id_test:
+        return train, val, id_test, test, params
     return train, val, test, params
 
 

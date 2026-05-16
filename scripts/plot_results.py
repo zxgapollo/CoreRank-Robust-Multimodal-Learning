@@ -36,7 +36,9 @@ def _load_results(
         summary = json.loads(summary_path.read_text())
         corerank = summary["corerank"]
         full_test = corerank["full_test"]
+        id_full_test = corerank.get("id_full_test", {})
         erm_full = summary.get("erm", {}).get("erm_full_test", {})
+        erm_id_full = summary.get("erm", {}).get("erm_id_full_test", {})
         gate_metrics = corerank["gate_metrics"]
         graph_metrics = corerank.get("graph_metrics", {})
         summary_rows.append(
@@ -45,9 +47,12 @@ def _load_results(
                 "seed": seed,
                 "corerank_auroc": full_test.get("auroc", np.nan),
                 "erm_auroc": erm_full.get("auroc", np.nan),
+                "corerank_id_auroc": id_full_test.get("auroc", np.nan),
+                "erm_id_auroc": erm_id_full.get("auroc", np.nan),
                 "corerank_accuracy": full_test.get("accuracy", np.nan),
                 "erm_accuracy": erm_full.get("accuracy", np.nan),
                 "latent_r2": full_test.get("latent_r2", np.nan),
+                "innovation_r2": full_test.get("innovation_r2", np.nan),
                 "latent_mcc": full_test.get("latent_mcc", np.nan),
                 "rank_logdet": full_test.get("rank_logdet", np.nan),
                 "effective_rank": full_test.get("effective_rank", np.nan),
@@ -58,6 +63,12 @@ def _load_results(
                 "gate_f1": gate_metrics.get("gate_f1", np.nan),
                 "core_graph_f1": graph_metrics.get("graph_f1", np.nan),
                 "core_graph_active": graph_metrics.get("graph_active", np.nan),
+                "best_epoch": corerank.get("best_epoch", np.nan),
+                "best_val_auroc": corerank.get("best_val_auroc", np.nan),
+                "best_val_auc_target": corerank.get("best_val_auc_target", np.nan),
+                "best_val_auc_floor": corerank.get("best_val_auc_floor", np.nan),
+                "best_val_context_leakage_r2": corerank.get("best_val_context_leakage_r2", np.nan),
+                "best_val_robust_score": corerank.get("best_val_robust_score", np.nan),
             }
         )
 
@@ -198,7 +209,7 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
         axes[1].errorbar(leak["subset_size"], leak["mean"], yerr=leak["sem"], marker="o", capsize=3, color="#6b5ca5")
         axes[1].set_xticks([1, 2, 3])
         axes[1].set_xlabel("Number of observed modalities")
-        axes[1].set_ylabel("Bias leakage R2 from z")
+        axes[1].set_ylabel("Bias leakage R2 from innovation")
         axes[1].set_title("Lower leakage is better")
         for ax in axes:
             ax.grid(axis="y", alpha=0.25)
@@ -223,12 +234,34 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
         axes[1].errorbar(leak["subset_size"], leak["mean"], yerr=leak["sem"], marker="o", capsize=3, color="#5d7f55")
         axes[1].set_xticks([1, 2, 3])
         axes[1].set_xlabel("Number of observed modalities")
-        axes[1].set_ylabel("Domain leakage R2 from z")
+        axes[1].set_ylabel("Domain leakage R2 from innovation")
         axes[1].set_title("Lower leakage is better")
         for ax in axes:
             ax.grid(axis="y", alpha=0.25)
         fig.tight_layout()
         fig.savefig(out_dir / "domain_shift_and_leakage.png")
+        plt.close(fig)
+
+    if summary_df["corerank_id_auroc"].notna().any():
+        fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.0), sharey=True)
+        core_id = _mean_sem(summary_df, ["scenario"], "corerank_id_auroc").set_index("scenario").reindex(scenarios)
+        core_ood = _mean_sem(summary_df, ["scenario"], "corerank_auroc").set_index("scenario").reindex(scenarios)
+        erm_id = _mean_sem(summary_df, ["scenario"], "erm_id_auroc").set_index("scenario").reindex(scenarios)
+        erm_ood = _mean_sem(summary_df, ["scenario"], "erm_auroc").set_index("scenario").reindex(scenarios)
+        axes[0].bar(x - width / 2, core_id["mean"], width, yerr=core_id["sem"], capsize=3, label="CoreRank", color=colors["CoreRank"])
+        axes[0].bar(x + width / 2, erm_id["mean"], width, yerr=erm_id["sem"], capsize=3, label="ERM", color=colors["ERM"])
+        axes[1].bar(x - width / 2, core_ood["mean"], width, yerr=core_ood["sem"], capsize=3, label="CoreRank", color=colors["CoreRank"])
+        axes[1].bar(x + width / 2, erm_ood["mean"], width, yerr=erm_ood["sem"], capsize=3, label="ERM", color=colors["ERM"])
+        for ax, title in zip(axes, ["ID test", "OOD / shifted test"]):
+            ax.set_xticks(x, [scenario_labels[s] for s in scenarios], rotation=15)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_title(title)
+            ax.grid(axis="y", alpha=0.25)
+        axes[0].set_ylabel("Full-modality AUROC")
+        axes[0].legend(frameon=False)
+        fig.suptitle("ID vs. OOD performance")
+        fig.tight_layout()
+        fig.savefig(out_dir / "id_vs_ood_auroc.png")
         plt.close(fig)
 
     fig, axes = plt.subplots(len(scenarios), 2, figsize=(7.8, 8.4), constrained_layout=True)

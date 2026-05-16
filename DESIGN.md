@@ -22,7 +22,7 @@ The synthetic benchmark must therefore expose ground-truth values for:
 6. missing-modality, concept-shift, and domain-shift settings,
 7. robust prediction targets.
 
-The first implementation should **not** claim full causal graph recovery. It should test local recoverability of the disease-core block and, optionally, sparse footprint recovery.
+The first implementation should **not** claim full causal graph recovery. It should test local recoverability of the disease-core block, sparse footprint recovery, and whether a structural innovation parameterization improves ID/OOD behavior.
 
 ---
 
@@ -56,7 +56,7 @@ The benchmark may expose a latent causal graph among core variables:
 A*[j, k] != 0 iff disease-core coordinate Z_k is a direct parent of Z_j.
 ```
 
-This graph is useful for data generation and for motivating examples such as age affecting recognition. The first CoreRank implementation does **not** learn this graph and should not claim internal causal-DAG recovery.
+This graph is useful for data generation and for motivating examples such as age affecting recognition. CoreRank may learn a soft structural graph over recovered coordinates, but this should not be presented as full internal causal-DAG recovery from observational data.
 
 The graph learned by the first implementation is instead the **modality-to-core footprint graph**:
 
@@ -66,13 +66,13 @@ G[m, j] = 1  iff modality m contains recoverable evidence about disease-core coo
 
 This is different from an internal causal graph among disease factors.
 
-The current implementation also includes an optional **core structural graph** learner:
+The current implementation includes a **core structural innovation** parameterization:
 
 ```text
-Z_j <- sum_k A[j, k] Z_k + E_j
+E = (I - A) Z - Gamma C
 ```
 
-It uses a NOTEARS-style acyclicity penalty and graph sparsity penalty. This should be presented as learning a soft structural prior over the recovered core coordinates, not as proof of full causal identification from observational data.
+The model places the prior and prediction head on innovation coordinates `E`, not directly on every modality-causing factor. `A` is constrained with a NOTEARS-style acyclicity penalty and graph sparsity penalty. It should be presented as a structured disease-core prior and nuisance-adjustment mechanism, not as proof of full causal identification.
 
 ### 2.4 Core variables are not all modality-causing variables
 
@@ -255,13 +255,13 @@ The decoder likelihood is Gaussian with fixed variance in the first implementati
 
 ### 4.3 Prediction head
 
-The classifier only reads the disease core:
+The classifier reads the disease-core innovation:
 
 ```text
-p(y | z, u_1, ..., u_M) = p(y | z).
+p(y | z, u_1, ..., u_M, C) = p(y | E),  E = (I - A)Z - Gamma C.
 ```
 
-This architecture-level restriction implements the conditional independence constraint. The nuisance variables are never given to the classifier.
+This architecture-level restriction implements the conditional independence constraint. The nuisance variables and context variables are not given directly to the classifier; their allowed role is to explain measurement/context effects that should not become disease-core evidence.
 
 ---
 
@@ -270,9 +270,15 @@ This architecture-level restriction implements the conditional independence cons
 For one sample with observed modalities `O`:
 
 ```math
-L_ELBO = E_q[log p(y | z) + sum_{m in O} log p(x_m | z, u_m)]
-         - KL(q(z | x_O) || p(z))
+L_ELBO = E_q[log p(y | E) + sum_{m in O} log p(x_m | z, u_m)]
+         - KL(q(z | x_O) || p_A(z | C))
          - sum_{m in O} KL(q(u_m | x_m) || p(u_m)).
+```
+
+Here `p_A(z | C)` is the SEM innovation prior induced by
+
+```math
+E = (I - A)Z - Gamma C,  E ~ N(0, I).
 ```
 
 The implemented minimization objective is:
@@ -283,13 +289,14 @@ J = -L_ELBO
     + 0.5 * rho_rank * relu(kappa - c_rank)^2
     + lambda_sparse * relu(Omega(G) - s)
     + 0.5 * rho_sparse * relu(Omega(G) - s)^2
-    + alpha_struct ||Z - A Z||^2
     + alpha_dag h(A)^2
     + alpha_A ||A||_1
-    + alpha_ctx Corr(Z, C)^2.
+    + alpha_ctx Corr(E, C)^2.
 ```
 
-The context-invariance term is optional and is only applied when known non-core context variables are available, such as synthetic bias variables, site/domain indicators, age, scanner, or visit timing. It encodes the claim that these variables may affect modalities but should not become disease-core coordinates.
+The context-invariance term is optional and is only applied when known non-core context variables are available, such as synthetic bias variables, site/domain indicators, age, scanner, or visit timing. It is applied to `E`, not raw `Z`, because the theory allows context to affect core measurements while requiring the prediction-relevant innovation to remain non-shortcut.
+
+Checkpoint selection also follows a constrained form: first require validation AUROC to be within a small tolerance of the best validation AUROC, then among these prediction-sufficient checkpoints prefer lower context leakage. This targets the desired behavior that CoreRank should match ERM in ID settings while improving robustness under OOD shifts.
 
 Dual variables are updated during training:
 
@@ -500,11 +507,12 @@ The current code implements:
 7. missing-modality evaluation over all modality subsets;
 8. ERM baseline;
 9. true-generator Fisher/rank diagnostics for the synthetic benchmark;
-10. bias/domain leakage probes from learned `z_hat`;
+10. bias/domain leakage probes from learned innovation `e_hat` and raw latent `z_hat`;
 11. temperature annealing and binary pressure options for soft footprint gates;
-12. optional core structural graph learning with acyclicity and sparsity penalties;
-13. optional context-invariance penalties for known non-core variables;
-14. metrics and CSV/JSON output.
+12. SEM innovation prior with a soft core structural graph, acyclicity, and sparsity penalties;
+13. context-invariance penalties for known non-core variables, applied to innovation coordinates;
+14. ID and OOD test splits plus prediction-sufficient checkpoint selection;
+15. metrics and CSV/JSON output.
 
 The first code drop does **not** implement:
 

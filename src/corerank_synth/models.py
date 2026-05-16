@@ -20,6 +20,7 @@ class ModelConfig:
     gate_temperature: float = 0.67
     init_gate_logit: float = 0.0
     decoder_noise_std: float = 0.35
+    context_dim: int = 2
     structural_classifier: bool = True
 
 
@@ -75,7 +76,7 @@ class SoftFootprintGates(nn.Module):
         return self.forward().sum()
 
 
-class CoreStructuralGraph(nn.Module):
+class CoreStructuralSEM(nn.Module):
     """Learn a directed graph among core coordinates.
 
     The graph is used as a soft linear SEM, z_j <- sum_k A[j, k] z_k + e_j.
@@ -83,10 +84,14 @@ class CoreStructuralGraph(nn.Module):
     enforces a zero diagonal.
     """
 
-    def __init__(self, z_dim: int, init_scale: float = 0.02):
+    def __init__(self, z_dim: int, context_dim: int, init_scale: float = 0.02):
         super().__init__()
+        self.z_dim = z_dim
+        self.context_dim = context_dim
         self.weight = nn.Parameter(init_scale * torch.randn(z_dim, z_dim))
+        self.context_weight = nn.Parameter(torch.zeros(z_dim, context_dim))
         self.register_buffer("offdiag_mask", torch.ones(z_dim, z_dim) - torch.eye(z_dim))
+        self.register_buffer("identity", torch.eye(z_dim))
 
     def adjacency(self) -> torch.Tensor:
         return self.weight * self.offdiag_mask
@@ -94,8 +99,25 @@ class CoreStructuralGraph(nn.Module):
     def predict(self, z: torch.Tensor) -> torch.Tensor:
         return z @ self.adjacency().T
 
-    def residual(self, z: torch.Tensor) -> torch.Tensor:
-        return z - self.predict(z)
+    def context_effect(self, context: torch.Tensor) -> torch.Tensor:
+        return context @ self.context_weight.T
+
+    def innovation(self, z: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        return z - self.predict(z) - self.context_effect(context)
+
+    def structural_matrix(self) -> torch.Tensor:
+        return self.identity - self.adjacency()
+
+    def log_abs_det(self) -> torch.Tensor:
+        _, logabsdet = torch.linalg.slogdet(self.structural_matrix())
+        return logabsdet
+
+    def innovation_jacobian(self) -> torch.Tensor:
+        return torch.linalg.inv(self.structural_matrix())
+
+    def transform_information_to_innovation(self, K_z: torch.Tensor) -> torch.Tensor:
+        jac = self.innovation_jacobian()
+        return torch.einsum("ij,bjk,kl->bil", jac.T, K_z, jac)
 
     def acyclicity(self) -> torch.Tensor:
         graph = self.adjacency()
@@ -118,9 +140,8 @@ class CoreRankVAE(nn.Module):
             for _ in range(cfg.n_modalities)
         ])
         self.gates = SoftFootprintGates(cfg.n_modalities, cfg.z_dim, cfg.init_gate_logit, cfg.gate_temperature)
-        self.core_graph = CoreStructuralGraph(cfg.z_dim)
-        classifier_in = cfg.z_dim * 3 if cfg.structural_classifier else cfg.z_dim
-        self.classifier = make_mlp(classifier_in, 1, cfg.hidden_dim, 2)
+        self.core_graph = CoreStructuralSEM(cfg.z_dim, cfg.context_dim)
+        self.classifier = make_mlp(cfg.z_dim, 1, cfg.hidden_dim, 2)
 
     def encode(self, xs: List[torch.Tensor], obs_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """Return q(z|x_O) mean/logvar and per-modality q(u_m|x_m) params.
@@ -161,21 +182,26 @@ class CoreRankVAE(nn.Module):
             recons.append(dec(g[m].unsqueeze(0) * z, us[m]))
         return recons
 
-    def core_features(self, z: torch.Tensor) -> torch.Tensor:
+    def _default_context(self, z: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(z.shape[0], self.cfg.context_dim, device=z.device, dtype=z.dtype)
+
+    def core_features(self, z: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         if not self.cfg.structural_classifier:
             return z
-        structural_pred = self.core_graph.predict(z)
-        structural_resid = z - structural_pred
-        return torch.cat([z, structural_pred, structural_resid], dim=-1)
+        context = self._default_context(z) if context is None else context
+        return self.core_graph.innovation(z, context)
 
-    def forward(self, xs: List[torch.Tensor], obs_mask: torch.Tensor, sample: bool = True) -> dict:
+    def forward(self, xs: List[torch.Tensor], obs_mask: torch.Tensor, context: Optional[torch.Tensor] = None, sample: bool = True) -> dict:
         z_mu, z_logvar, u_mus, u_logvars = self.encode(xs, obs_mask)
+        context = self._default_context(z_mu) if context is None else context
         z = self.reparameterize(z_mu, z_logvar, sample=sample)
         us = [self.reparameterize(mu, lv, sample=sample) for mu, lv in zip(u_mus, u_logvars)]
         recons = self.decode(z, us)
         structural_pred = self.core_graph.predict(z_mu)
-        structural_resid = z_mu - structural_pred
-        logits = self.classifier(self.core_features(z))
+        structural_context = self.core_graph.context_effect(context)
+        innovation_mu = self.core_graph.innovation(z_mu, context)
+        innovation = self.core_graph.innovation(z, context)
+        logits = self.classifier(innovation if self.cfg.structural_classifier else z)
         return {
             "z": z,
             "z_mu": z_mu,
@@ -186,12 +212,31 @@ class CoreRankVAE(nn.Module):
             "recon": recons,
             "logits": logits,
             "structural_pred": structural_pred,
-            "structural_resid": structural_resid,
+            "structural_context": structural_context,
+            "innovation": innovation,
+            "innovation_mu": innovation_mu,
         }
 
 
 def kl_standard_normal(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1.0 - logvar, dim=-1)
+
+
+def kl_sem_normal(mu: torch.Tensor, logvar: torch.Tensor, sem: CoreStructuralSEM, context: torch.Tensor) -> torch.Tensor:
+    """KL(q(z|x) || p_A(z|context)) for a linear SEM innovation prior.
+
+    p_A is defined by e = (I - A)z - Gamma c, e ~ N(0, I).
+    """
+    graph_matrix = sem.structural_matrix()
+    innovation_mu = sem.innovation(mu, context)
+    var = torch.exp(logvar)
+    var_term = (graph_matrix.pow(2).sum(dim=0).unsqueeze(0) * var).sum(dim=-1)
+    mean_term = innovation_mu.pow(2).sum(dim=-1)
+    entropy_term = logvar.sum(dim=-1)
+    # For an acyclic zero-diagonal SEM, det(I - A) = 1. The acyclicity
+    # constraint makes the log-Jacobian term constant, so the KL only needs
+    # the Gaussian innovation energy and posterior entropy.
+    return 0.5 * (mean_term + var_term - mu.shape[-1] - entropy_term)
 
 
 class EarlyFusionClassifier(nn.Module):
