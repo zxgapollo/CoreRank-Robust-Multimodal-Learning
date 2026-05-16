@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+
+SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if SRC_DIR.exists():
+    sys.path.insert(0, str(SRC_DIR))
+try:
+    from corerank_synth.metrics import dag_metrics as _dag_metrics
+    from corerank_synth.metrics import directed_graph_metrics as _directed_graph_metrics
+except Exception:
+    _dag_metrics = None
+    _directed_graph_metrics = None
 
 
 def _load_results(
@@ -41,6 +52,15 @@ def _load_results(
         erm_id_full = summary.get("erm", {}).get("erm_id_full_test", {})
         gate_metrics = corerank["gate_metrics"]
         graph_metrics = corerank.get("graph_metrics", {})
+        dag_diag = corerank.get("dag_metrics", {})
+        learned_graph = np.asarray(corerank.get("learned_core_graph", []), dtype=float)
+        true_graph = np.asarray(corerank.get("true_core_graph", []), dtype=float)
+        if learned_graph.ndim == 2 and learned_graph.size:
+            if _dag_metrics is not None and not dag_diag:
+                dag_diag = _dag_metrics(learned_graph)
+            if _directed_graph_metrics is not None and true_graph.ndim == 2 and true_graph.size:
+                computed_graph_metrics = _directed_graph_metrics(learned_graph, true_graph)
+                graph_metrics = {**computed_graph_metrics, **graph_metrics}
         summary_rows.append(
             {
                 "scenario": scenario,
@@ -61,8 +81,23 @@ def _load_results(
                 "bias_leakage_r2": full_test.get("bias_leakage_r2", np.nan),
                 "domain_leakage_r2": full_test.get("domain_leakage_r2", np.nan),
                 "gate_f1": gate_metrics.get("gate_f1", np.nan),
+                "graph_precision": graph_metrics.get("graph_precision", np.nan),
+                "graph_recall": graph_metrics.get("graph_recall", np.nan),
                 "core_graph_f1": graph_metrics.get("graph_f1", np.nan),
                 "core_graph_active": graph_metrics.get("graph_active", np.nan),
+                "core_graph_true_edges": graph_metrics.get("graph_true_edges", np.nan),
+                "core_graph_skeleton_f1": graph_metrics.get("graph_skeleton_f1", np.nan),
+                "core_graph_directed_hamming": graph_metrics.get("graph_directed_hamming", np.nan),
+                "core_graph_reversed_edges": graph_metrics.get("graph_reversed_edges", np.nan),
+                "core_graph_edge_auroc": graph_metrics.get("graph_edge_auroc", np.nan),
+                "core_graph_edge_auprc": graph_metrics.get("graph_edge_auprc", np.nan),
+                "dag_acyclicity": dag_diag.get("dag_acyclicity", np.nan),
+                "dag_threshold_is_acyclic": dag_diag.get("dag_threshold_is_acyclic", np.nan),
+                "dag_active_edges": dag_diag.get("dag_active_edges", np.nan),
+                "dag_density": dag_diag.get("dag_density", np.nan),
+                "dag_l1": dag_diag.get("dag_l1", np.nan),
+                "dag_l2": dag_diag.get("dag_l2", np.nan),
+                "dag_max_abs_weight": dag_diag.get("dag_max_abs_weight", np.nan),
                 "best_epoch": corerank.get("best_epoch", np.nan),
                 "best_val_auroc": corerank.get("best_val_auroc", np.nan),
                 "best_val_auc_target": corerank.get("best_val_auc_target", np.nan),
@@ -79,9 +114,9 @@ def _load_results(
 
         gates.setdefault(scenario, []).append(np.asarray(corerank["final_gates"], dtype=float))
         true_fp.setdefault(scenario, np.asarray(corerank["true_footprint"], dtype=float))
-        if "learned_core_graph" in corerank and "true_core_graph" in corerank:
-            core_graphs.setdefault(scenario, []).append(np.asarray(corerank["learned_core_graph"], dtype=float))
-            true_core_graph.setdefault(scenario, np.asarray(corerank["true_core_graph"], dtype=float))
+        if learned_graph.ndim == 2 and learned_graph.size and true_graph.ndim == 2 and true_graph.size:
+            core_graphs.setdefault(scenario, []).append(learned_graph)
+            true_core_graph.setdefault(scenario, true_graph)
 
     if not summary_rows:
         raise RuntimeError(f"No complete result runs found under {base_dir}")
@@ -262,6 +297,32 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
         fig.suptitle("ID vs. OOD performance")
         fig.tight_layout()
         fig.savefig(out_dir / "id_vs_ood_auroc.png")
+        plt.close(fig)
+
+    if summary_df["dag_acyclicity"].notna().any():
+        fig, axes = plt.subplots(1, 4, figsize=(13.0, 3.7))
+        dag_h = _mean_sem(summary_df, ["scenario"], "dag_acyclicity").set_index("scenario").reindex(scenarios)
+        dag_edges = _mean_sem(summary_df, ["scenario"], "dag_active_edges").set_index("scenario").reindex(scenarios)
+        skel = _mean_sem(summary_df, ["scenario"], "core_graph_skeleton_f1").set_index("scenario").reindex(scenarios)
+        directed = _mean_sem(summary_df, ["scenario"], "core_graph_f1").set_index("scenario").reindex(scenarios)
+        axes[0].bar(x, dag_h["mean"], yerr=dag_h["sem"], capsize=3, color="#6b5ca5")
+        axes[0].set_title("DAG penalty")
+        axes[0].set_ylabel("NOTEARS h(A)")
+        axes[1].bar(x, dag_edges["mean"], yerr=dag_edges["sem"], capsize=3, color="#5d7f55")
+        axes[1].set_title("Active edges")
+        axes[1].set_ylabel("Edges >= threshold")
+        axes[2].bar(x, skel["mean"], yerr=skel["sem"], capsize=3, color="#a67843")
+        axes[2].set_title("Skeleton recovery")
+        axes[2].set_ylabel("Skeleton F1")
+        axes[3].bar(x, directed["mean"], yerr=directed["sem"], capsize=3, color="#2f6fbb")
+        axes[3].set_title("Directed recovery")
+        axes[3].set_ylabel("Directed F1")
+        for ax in axes:
+            ax.set_xticks(x, [scenario_labels[s] for s in scenarios], rotation=20)
+            ax.grid(axis="y", alpha=0.25)
+        fig.suptitle("Structural graph diagnostics")
+        fig.tight_layout()
+        fig.savefig(out_dir / "dag_graph_diagnostics.png")
         plt.close(fig)
 
     fig, axes = plt.subplots(len(scenarios), 2, figsize=(7.8, 8.4), constrained_layout=True)

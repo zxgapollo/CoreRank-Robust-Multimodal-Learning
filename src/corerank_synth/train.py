@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from .data import SyntheticConfig, SyntheticDataset, SyntheticParams, SyntheticSplit, collate_batch, true_fisher_for_split
 from .fisher import batch_core_information, rank_score_from_K
-from .metrics import binary_metrics, directed_graph_metrics, footprint_metrics, linear_probe_r2, mean_corrcoef_matching, ridge_r2
+from .metrics import binary_metrics, dag_metrics, directed_graph_metrics, footprint_metrics, linear_probe_r2, mean_corrcoef_matching, ridge_r2
 from .models import CoreRankVAE, EarlyFusionClassifier, ModelConfig, kl_sem_normal, kl_standard_normal
 
 
@@ -553,9 +553,11 @@ def evaluate_model(
     learned_core_graph = model.core_graph.adjacency().detach().cpu().numpy()
     gate_metrics = footprint_metrics(gates, params.footprint)
     graph_metrics = directed_graph_metrics(learned_core_graph, params.core_graph)
+    dag_diagnostics = dag_metrics(learned_core_graph)
     main = {
         "gate_metrics": gate_metrics,
         "graph_metrics": graph_metrics,
+        "dag_metrics": dag_diagnostics,
         "final_gates": gates.tolist(),
         "learned_core_graph": learned_core_graph.tolist(),
         "true_core_graph": params.core_graph.tolist(),

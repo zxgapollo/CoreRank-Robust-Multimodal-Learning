@@ -465,9 +465,21 @@ For each modality subset:
 
 The normalized logdet score must not add isotropic jitter before trace normalization. Otherwise a zero-information matrix can be converted into an artificial identity matrix and falsely appear full rank. Numerical stabilization is applied after preserving the zero-information case.
 
-### 7.5 Bias leakage
+### 7.5 Structural DAG diagnostics
 
-Fit a ridge/logistic probe from `z_hat` to known nuisance bias variables. Lower R2/AUC means less leakage.
+Report structural diagnostics separately from predictive metrics:
+
+- continuous NOTEARS acyclicity `h(A) = tr(exp(A o A)) - r`;
+- thresholded-DAG validity, active edge count, density, L1/L2 graph size;
+- raw directed precision/recall/F1 and directed Hamming distance;
+- skeleton precision/recall/F1, which ignores arrow direction;
+- reversed-edge count, sign accuracy, edge AUROC/AUPRC.
+
+These diagnostics should be interpreted cautiously because latent coordinates are only locally identifiable up to transformations unless additional anchoring is imposed. In the first synthetic benchmark, a low `h(A)` supports the claim that the learned structural prior is DAG-like; it does not by itself prove recovery of the true causal DAG.
+
+### 7.6 Bias leakage
+
+Fit a ridge/logistic probe from learned innovation `e_hat` and raw latent `z_hat` to known nuisance bias variables. Lower R2/AUC means less leakage.
 
 ---
 

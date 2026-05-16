@@ -96,10 +96,78 @@ def footprint_metrics(gate: np.ndarray, true_fp: np.ndarray, threshold: float = 
     }
 
 
+def _offdiag_mask(dim: int) -> np.ndarray:
+    return 1 - np.eye(dim, dtype=int)
+
+
+def _matrix_exponential(mat: np.ndarray) -> np.ndarray:
+    try:
+        from scipy.linalg import expm
+
+        return expm(mat)
+    except Exception:
+        out = np.eye(mat.shape[0], dtype=np.float64)
+        term = np.eye(mat.shape[0], dtype=np.float64)
+        for k in range(1, 32):
+            term = term @ mat / k
+            out = out + term
+        return out
+
+
+def dag_acyclicity(weight: np.ndarray) -> float:
+    """NOTEARS acyclicity value h(W)=tr(exp(W o W))-d."""
+    w = np.asarray(weight, dtype=np.float64)
+    if w.ndim != 2 or w.shape[0] != w.shape[1]:
+        raise ValueError(f"Expected a square graph matrix, got {w.shape}")
+    masked = w * _offdiag_mask(w.shape[0])
+    return float(np.trace(_matrix_exponential(masked * masked)) - masked.shape[0])
+
+
+def _has_directed_cycle(adj: np.ndarray) -> bool:
+    graph = np.asarray(adj, dtype=int)
+    n = graph.shape[0]
+    state = np.zeros(n, dtype=np.int8)
+
+    def visit(node: int) -> bool:
+        state[node] = 1
+        for child in np.where(graph[:, node] != 0)[0]:
+            if state[child] == 1:
+                return True
+            if state[child] == 0 and visit(int(child)):
+                return True
+        state[node] = 2
+        return False
+
+    for node in range(n):
+        if state[node] == 0 and visit(node):
+            return True
+    return False
+
+
+def dag_metrics(weight: np.ndarray, threshold: float = 0.05) -> Dict[str, float]:
+    w = np.asarray(weight, dtype=np.float64)
+    if w.ndim != 2 or w.shape[0] != w.shape[1]:
+        raise ValueError(f"Expected a square graph matrix, got {w.shape}")
+    offdiag = _offdiag_mask(w.shape[0])
+    pred = ((np.abs(w) >= threshold).astype(int) * offdiag).astype(int)
+    active = float(pred.sum())
+    possible = float(offdiag.sum())
+    return {
+        "dag_acyclicity": dag_acyclicity(w),
+        "dag_threshold_is_acyclic": float(not _has_directed_cycle(pred)),
+        "dag_active_edges": active,
+        "dag_density": active / max(1.0, possible),
+        "dag_l1": float(np.abs(w * offdiag).sum()),
+        "dag_l2": float(np.sqrt(((w * offdiag) ** 2).sum())),
+        "dag_max_abs_weight": float(np.abs(w * offdiag).max(initial=0.0)),
+        "dag_max_abs_diagonal": float(np.abs(np.diag(w)).max(initial=0.0)),
+    }
+
+
 def directed_graph_metrics(weight: np.ndarray, true_graph: np.ndarray, threshold: float = 0.05) -> Dict[str, float]:
     pred = (np.abs(weight) >= threshold).astype(int)
     true = (np.abs(true_graph) > 1e-8).astype(int)
-    offdiag = 1 - np.eye(true.shape[0], dtype=int)
+    offdiag = _offdiag_mask(true.shape[0])
     pred = pred * offdiag
     true = true * offdiag
     tp = int(((pred == 1) & (true == 1)).sum())
@@ -110,18 +178,52 @@ def directed_graph_metrics(weight: np.ndarray, true_graph: np.ndarray, threshold
     recall = tp / max(1, tp + fn)
     f1 = 2 * precision * recall / max(1e-12, precision + recall)
     acc = (tp + tn) / max(1, tp + fp + fn + tn)
+    fdr = fp / max(1, tp + fp)
+    directed_hamming = fp + fn
+    reversed_edges = int(((pred == 1) & (true.T == 1) & (true == 0)).sum())
+    pred_skel = ((pred + pred.T) > 0).astype(int)
+    true_skel = ((true + true.T) > 0).astype(int)
+    upper = np.triu(np.ones_like(true_skel, dtype=bool), k=1)
+    sk_tp = int(((pred_skel == 1) & (true_skel == 1) & upper).sum())
+    sk_fp = int(((pred_skel == 1) & (true_skel == 0) & upper).sum())
+    sk_fn = int(((pred_skel == 0) & (true_skel == 1) & upper).sum())
+    sk_precision = sk_tp / max(1, sk_tp + sk_fp)
+    sk_recall = sk_tp / max(1, sk_tp + sk_fn)
+    sk_f1 = 2 * sk_precision * sk_recall / max(1e-12, sk_precision + sk_recall)
     true_edge_mask = true.astype(bool)
     if true_edge_mask.any():
         sign_acc = float((np.sign(weight[true_edge_mask]) == np.sign(true_graph[true_edge_mask])).mean())
+        weight_corr = float(np.corrcoef(weight[true_edge_mask].reshape(-1), true_graph[true_edge_mask].reshape(-1))[0, 1]) if true_edge_mask.sum() > 1 else float("nan")
     else:
         sign_acc = float("nan")
+        weight_corr = float("nan")
+    scores = np.abs(weight[offdiag.astype(bool)]).reshape(-1)
+    labels = true[offdiag.astype(bool)].reshape(-1).astype(int)
+    try:
+        from sklearn.metrics import average_precision_score, roc_auc_score
+
+        edge_auroc = float(roc_auc_score(labels, scores)) if len(np.unique(labels)) > 1 else float("nan")
+        edge_auprc = float(average_precision_score(labels, scores)) if len(np.unique(labels)) > 1 else float("nan")
+    except Exception:
+        edge_auroc = float("nan")
+        edge_auprc = float("nan")
     return {
         "graph_precision": float(precision),
         "graph_recall": float(recall),
         "graph_f1": float(f1),
         "graph_accuracy": float(acc),
+        "graph_fdr": float(fdr),
         "graph_active": float(pred.sum()),
+        "graph_true_edges": float(true.sum()),
+        "graph_directed_hamming": float(directed_hamming),
+        "graph_reversed_edges": float(reversed_edges),
+        "graph_skeleton_precision": float(sk_precision),
+        "graph_skeleton_recall": float(sk_recall),
+        "graph_skeleton_f1": float(sk_f1),
         "graph_sign_accuracy": sign_acc,
+        "graph_weight_corr_true_edges": weight_corr,
+        "graph_edge_auroc": edge_auroc,
+        "graph_edge_auprc": edge_auprc,
     }
 
 
