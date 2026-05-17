@@ -73,6 +73,10 @@ def _load_results(
                 "erm_accuracy": erm_full.get("accuracy", np.nan),
                 "latent_r2": full_test.get("latent_r2", np.nan),
                 "innovation_r2": full_test.get("innovation_r2", np.nan),
+                "target_core_r2": full_test.get("target_core_r2", np.nan),
+                "target_innovation_r2": full_test.get("target_innovation_r2", np.nan),
+                "noncore_latent_r2": full_test.get("noncore_latent_r2", np.nan),
+                "noncore_innovation_r2": full_test.get("noncore_innovation_r2", np.nan),
                 "latent_mcc": full_test.get("latent_mcc", np.nan),
                 "rank_logdet": full_test.get("rank_logdet", np.nan),
                 "effective_rank": full_test.get("effective_rank", np.nan),
@@ -102,7 +106,10 @@ def _load_results(
                 "best_val_auroc": corerank.get("best_val_auroc", np.nan),
                 "best_val_auc_target": corerank.get("best_val_auc_target", np.nan),
                 "best_val_auc_floor": corerank.get("best_val_auc_floor", np.nan),
-                "best_val_context_leakage_r2": corerank.get("best_val_context_leakage_r2", np.nan),
+                "best_val_oracle_shortcut_leakage_r2": corerank.get(
+                    "best_val_oracle_shortcut_leakage_r2",
+                    corerank.get("best_val_context_leakage_r2", np.nan),
+                ),
                 "best_val_robust_score": corerank.get("best_val_robust_score", np.nan),
             }
         )
@@ -152,9 +159,17 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
     summary_df.to_csv(out_dir / "full_test_summary.csv", index=False)
     subset_df.to_csv(out_dir / "all_subset_metrics.csv", index=False)
 
-    scenario_order = ["complementary", "redundant", "biased", "domain"]
+    scenario_order = ["complementary", "redundant", "shortcut", "measurement", "semantic", "biased", "domain"]
     scenarios = [s for s in scenario_order if s in set(summary_df["scenario"])]
-    scenario_labels = {"complementary": "Complementary", "redundant": "Redundant", "biased": "Biased", "domain": "Domain"}
+    scenario_labels = {
+        "complementary": "Complementary",
+        "redundant": "Redundant",
+        "shortcut": "Shortcut",
+        "measurement": "Measurement",
+        "semantic": "Semantic",
+        "biased": "Biased",
+        "domain": "Domain",
+    }
     colors = {"CoreRank": "#2f6fbb", "ERM": "#cc6b49"}
 
     fig, ax = plt.subplots(figsize=(7.6, 4.2))
@@ -227,9 +242,10 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
         fig.savefig(out_dir / "true_rank_vs_recovery.png")
         plt.close(fig)
 
-    if "biased" in scenarios:
-        biased = test_subset[test_subset["scenario"] == "biased"].copy()
-        full_biased = summary_df[summary_df["scenario"] == "biased"].copy()
+    shortcut_name = "shortcut" if "shortcut" in scenarios else "biased" if "biased" in scenarios else None
+    if shortcut_name is not None:
+        biased = test_subset[test_subset["scenario"] == shortcut_name].copy()
+        full_biased = summary_df[summary_df["scenario"] == shortcut_name].copy()
         fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0))
         vals = [
             full_biased["corerank_auroc"].dropna().to_numpy(),
@@ -239,7 +255,7 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
         axes[0].scatter(np.repeat(1, len(vals[0])), vals[0], color=colors["CoreRank"], zorder=3)
         axes[0].scatter(np.repeat(2, len(vals[1])), vals[1], color=colors["ERM"], zorder=3)
         axes[0].set_ylabel("OOD test AUROC")
-        axes[0].set_title("Biased scenario")
+        axes[0].set_title(f"{scenario_labels[shortcut_name]} scenario")
         leak = _mean_sem(biased, ["subset_size"], "bias_leakage_r2")
         axes[1].errorbar(leak["subset_size"], leak["mean"], yerr=leak["sem"], marker="o", capsize=3, color="#6b5ca5")
         axes[1].set_xticks([1, 2, 3])
@@ -249,12 +265,13 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
         for ax in axes:
             ax.grid(axis="y", alpha=0.25)
         fig.tight_layout()
-        fig.savefig(out_dir / "biased_ood_and_leakage.png")
+        fig.savefig(out_dir / "shortcut_ood_and_leakage.png")
         plt.close(fig)
 
-    if "domain" in scenarios:
-        domain = test_subset[test_subset["scenario"] == "domain"].copy()
-        full_domain = summary_df[summary_df["scenario"] == "domain"].copy()
+    measurement_name = "measurement" if "measurement" in scenarios else "domain" if "domain" in scenarios else None
+    if measurement_name is not None:
+        domain = test_subset[test_subset["scenario"] == measurement_name].copy()
+        full_domain = summary_df[summary_df["scenario"] == measurement_name].copy()
         fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0))
         vals = [
             full_domain["corerank_auroc"].dropna().to_numpy(),
@@ -264,7 +281,7 @@ def make_plots(base_dir: Path, out_dir: Path) -> None:
         axes[0].scatter(np.repeat(1, len(vals[0])), vals[0], color=colors["CoreRank"], zorder=3)
         axes[0].scatter(np.repeat(2, len(vals[1])), vals[1], color=colors["ERM"], zorder=3)
         axes[0].set_ylabel("Shifted-domain test AUROC")
-        axes[0].set_title("Domain scenario")
+        axes[0].set_title(f"{scenario_labels[measurement_name]} scenario")
         leak = _mean_sem(domain, ["subset_size"], "domain_leakage_r2")
         axes[1].errorbar(leak["subset_size"], leak["mean"], yerr=leak["sem"], marker="o", capsize=3, color="#5d7f55")
         axes[1].set_xticks([1, 2, 3])

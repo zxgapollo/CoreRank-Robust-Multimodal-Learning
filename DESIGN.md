@@ -16,7 +16,7 @@ The synthetic benchmark must therefore expose ground-truth values for:
 
 1. disease core `Z*` and its latent causal graph `A*`,
 2. modality-private nuisance variables `U_m`,
-3. non-core context/shortcut variables such as age, site, scanner, visit timing, or gene covariates,
+3. observed covariate modalities such as demographic, comorbidity, site/scanner metadata, visit timing, or gene covariates,
 4. modality-to-core footprint graph `G*`,
 5. true modality evidence matrices and effective core rank,
 6. missing-modality, concept-shift, and domain-shift settings,
@@ -69,10 +69,10 @@ This is different from an internal causal graph among disease factors.
 The current implementation includes a **core structural innovation** parameterization:
 
 ```text
-E = (I - A) Z - Gamma C
+E = (I - A) Z
 ```
 
-The model places the prior and prediction head on innovation coordinates `E`, not directly on every modality-causing factor. `A` is constrained with a NOTEARS-style acyclicity penalty and graph sparsity penalty. It should be presented as a structured disease-core prior and nuisance-adjustment mechanism, not as proof of full causal identification.
+The model places the prior and prediction head on innovation coordinates `E`, not directly on every modality-causing factor. Demographic/comorbidity/site variables are not passed in as privileged context `C`; when observed, they are ordinary modalities `X_m`. `A` is constrained with a NOTEARS-style acyclicity penalty and graph sparsity penalty. It should be presented as a structured disease-core prior and nuisance-adjustment mechanism, not as proof of full causal identification.
 
 ### 2.4 Core variables are not all modality-causing variables
 
@@ -84,7 +84,7 @@ For example, age can affect recognition scores. If the target is Alzheimer disea
 Age -> recognition-like measurement -> classifier
 ```
 
-can be a problematic shortcut when train and test age distributions differ. CoreRank should represent this as context/nuisance-adjusted evidence, not as proof that age itself is a disease-core coordinate.
+can be a problematic shortcut when train and test age distributions differ. CoreRank should see age through the same modality interface as every other observed source and decide whether it contributes stable disease-core evidence or modality-private nuisance.
 
 ### 2.5 Do not implement the objective as a loss pile
 
@@ -130,29 +130,29 @@ This assumes that modalities are conditionally independent given the disease cor
 For each sample:
 
 ```math
-Z* in R^r                    disease core
-A*                           latent causal graph among disease-core coordinates
-C                            observed or latent non-core context: age, sex, site, gene, scanner, visit timing
+S in R^p                     latent semantic variables: disease, risk, demographic, comorbidity, measurement factors
+Z* = P_core S                stable disease-core subspace / subset used for robust prediction
+A*                           latent causal graph among semantic variables
 U_m in R^q                   modality-private nuisance / bias
 Y ~ Bernoulli(sigmoid(beta^T Z* + nonlinear terms))
 ```
 
-The synthetic code samples `Z*` from a simple acyclic structural equation model:
+The synthetic code samples semantic variables `S` from a simple acyclic structural equation model:
 
 ```math
-Z_j = sum_{k in Pa(j)} A^*_{jk} Z_k + E_j.
+S_j = sum_{k in Pa(j)} A^*_{jk} S_k + E_j.
 ```
 
-This allows us to talk about causal relations among core coordinates while keeping graph recovery out of scope for the first method.
+The disease core is not required to be the whole graph. A core coordinate may be a parent of some observed semantic variables, a child of risk factors, or a subset/direction inside the semantic graph. This lets cases such as age, APOE, comorbidity, or recognition scores influence modalities without automatically becoming the disease core.
 
-Each modality is generated from a subset of disease-core coordinates and its private nuisance:
+Each modality is generated from a subset of semantic coordinates and its private nuisance:
 
 ```math
-X_m = f_m(G*_m \odot Z*, U_m, C, B_m, D_m, eps_m).
+X_m = f_m(G*_m \odot S, U_m, B_m, D_m, eps_m).
 ```
 
-`B_m` is an explicit spurious bias variable used for robustness testing. It affects the modality but is not a true cause of `Y`.
-`D_m` is a domain/mechanism variable such as site or scanner shift. It changes the observation mechanism but not the disease label mechanism.
+`B_m` is an explicit spurious shortcut variable used for robustness diagnostics. It affects an observed modality but is not a stable cause of `Y`.
+`D_m` is a domain/mechanism variable such as site or scanner shift. It changes the observation mechanism but not the disease label mechanism. Both are diagnostic ground truths in synthetic data, not privileged inputs to CoreRank.
 
 ### 3.2 Nuisance-adjusted core Fisher
 
@@ -258,10 +258,10 @@ The decoder likelihood is Gaussian with fixed variance in the first implementati
 The classifier reads the disease-core innovation:
 
 ```text
-p(y | z, u_1, ..., u_M, C) = p(y | E),  E = (I - A)Z - Gamma C.
+p(y | z, u_1, ..., u_M) = p(y | E),  E = (I - A)Z.
 ```
 
-This architecture-level restriction implements the conditional independence constraint. The nuisance variables and context variables are not given directly to the classifier; their allowed role is to explain measurement/context effects that should not become disease-core evidence.
+This architecture-level restriction implements the conditional independence constraint. Private nuisance variables are never given to the classifier. Observed demographics/comorbidities/site variables are treated as modalities, so they can help only by contributing stable recoverable evidence to `Z`; shortcut information should be absorbed as modality-private variation.
 
 ---
 
@@ -271,14 +271,14 @@ For one sample with observed modalities `O`:
 
 ```math
 L_ELBO = E_q[log p(y | E) + sum_{m in O} log p(x_m | z, u_m)]
-         - KL(q(z | x_O) || p_A(z | C))
+         - KL(q(z | x_O) || p_A(z))
          - sum_{m in O} KL(q(u_m | x_m) || p(u_m)).
 ```
 
-Here `p_A(z | C)` is the SEM innovation prior induced by
+Here `p_A(z)` is the SEM innovation prior induced by
 
 ```math
-E = (I - A)Z - Gamma C,  E ~ N(0, I).
+E = (I - A)Z,  E ~ N(0, I).
 ```
 
 The implemented minimization objective is:
@@ -290,13 +290,12 @@ J = -L_ELBO
     + lambda_sparse * relu(Omega(G) - s)
     + 0.5 * rho_sparse * relu(Omega(G) - s)^2
     + alpha_dag h(A)^2
-    + alpha_A ||A||_1
-    + alpha_ctx Corr(E, C)^2.
+    + alpha_A ||A||_1.
 ```
 
-The context-invariance term is optional and is only applied when known non-core context variables are available, such as synthetic bias variables, site/domain indicators, age, scanner, or visit timing. It is applied to `E`, not raw `Z`, because the theory allows context to affect core measurements while requiring the prediction-relevant innovation to remain non-shortcut.
+Synthetic shortcut/domain labels are used only for post-hoc diagnostics. They are not used in the training objective and not used to select checkpoints.
 
-Checkpoint selection also follows a constrained form: first require validation AUROC to be within a small tolerance of the best validation AUROC, then among these prediction-sufficient checkpoints prefer lower context leakage. This targets the desired behavior that CoreRank should match ERM in ID settings while improving robustness under OOD shifts.
+Checkpoint selection follows a predictive-sufficiency rule on ID validation data: select among checkpoints whose validation AUROC is within a small tolerance of the best validation AUROC, without using oracle shortcut labels. OOD robustness is then measured on held-out shifted test sets.
 
 Dual variables are updated during training:
 
@@ -322,15 +321,16 @@ q = 3 private nuisance dimensions per modality
 x_dim = 16 per modality
 ```
 
-Ground-truth footprint:
+Ground-truth 4-modality footprint:
 
 ```text
-modality 0 observes Z0, Z1, Z2
-modality 1 observes Z2, Z3, Z4
-modality 2 observes Z1, Z4, Z5
+modality 0 observes semantic coordinates S2, S3
+modality 1 observes semantic coordinates S3, S4
+modality 2 observes semantic coordinates S2, S4
+modality 3 observes demographic/comorbidity/proxy coordinates S0, S1, S5
 ```
 
-Single modalities are rank deficient. All modalities together are full rank.
+The stable disease-core mask is `S2,S3,S4`. The fourth modality is deliberately a covariate modality: it can be predictive in train through risk/proxy correlations, but it is not given as a privileged adjustment variable.
 
 Expected behavior:
 
@@ -346,7 +346,7 @@ Purpose: test that adding a modality with redundant Fisher directions gives litt
 Modify footprint so modality 2 mostly duplicates modality 0:
 
 ```text
-modality 2 observes Z0, Z1, Z2.
+modality 2 observes S2, S3.
 ```
 
 Expected behavior:
@@ -355,9 +355,9 @@ Expected behavior:
 2. Prediction gain from adding modality 2 to modality 0 should be small.
 3. Rank-gain should be predictive of downstream gain.
 
-### 6.3 Case-I: concept/covariate shortcut shift
+### 6.3 OOD-I: demographic/comorbidity shortcut shift
 
-Purpose: test robustness when one modality contains a strong non-core shortcut correlated with the label in training but shifted at test time.
+Purpose: test robustness when the covariate modality contains a strong non-core shortcut correlated with the label in training but shifted at test time.
 
 This is the synthetic analogue of the PPT case where age affects a recognition-like measurement, but using the age-related path as an Alzheimer classifier shortcut is unstable when the age distribution differs between train and test.
 
@@ -369,15 +369,15 @@ B_m = rho_split * (2Y - 1) + sqrt(1 - rho_split^2) * eps.
 
 Train uses positive correlation, e.g. `rho_train = 0.9`.
 OOD test uses negative or zero correlation, e.g. `rho_test = -0.6` or `0.0`.
-The implementation applies this explicit spurious shift to one configurable modality by default, while keeping the other modalities governed by their core and private nuisance terms.
+The implementation applies this explicit spurious shift to the demographic/comorbidity modality by default, while keeping the other modalities governed by stable core and private nuisance terms.
 
 Expected behavior:
 
 1. ERM fusion should overfit the biased modality.
-2. CoreRank should be more robust if the nuisance pathway `u_m` absorbs the bias and the classifier is restricted to `z`.
-3. Measure bias leakage by predicting the known bias scalar from learned `z_hat`. Lower is better.
+2. CoreRank should be more robust if the nuisance pathway `u_m` absorbs the shortcut and the classifier is restricted to the recovered innovation `E`.
+3. Measure shortcut leakage by predicting the known synthetic shortcut scalar from learned `e_hat` and `z_hat`. Lower is better. This probe is diagnostic only.
 
-### 6.4 Case-II: domain/mechanism shift
+### 6.4 OOD-II: domain/mechanism shortcut shift
 
 Purpose: test robustness when a modality's observation mechanism changes across domains, even though the disease-label mechanism remains stable.
 
@@ -395,7 +395,7 @@ Generation:
 X_m = f_m(G^*_m \odot Z^*, U_m, eps_m) + gamma_domain D_m v_m.
 ```
 
-Train and validation have one domain value; OOD test shifts `D_m`. This should be absorbed by nuisance/domain-specific variation rather than becoming disease-core evidence.
+Train and validation have a site/scanner variable correlated with the label; OOD test reverses or weakens that correlation. This should be absorbed by nuisance/domain-specific variation rather than becoming disease-core evidence. The domain variable is not passed to the model separately.
 
 Expected behavior:
 
@@ -403,7 +403,25 @@ Expected behavior:
 2. CoreRank should be less sensitive when the shifted direction is nuisance-adjusted.
 3. Oracle Fisher diagnostics should still identify which observed modalities carry recoverable core directions.
 
-### 6.5 Case-III: missing information / incomplete core coverage
+### 6.5 OOD-III: semantic proxy shift
+
+Purpose: test robustness when a non-core semantic variable, such as age, comorbidity burden, or a downstream cognitive proxy, is highly label-correlated in training but the semantic relationship changes at test time.
+
+Generation:
+
+```math
+S_proxy = rho_split * (2Y - 1) + sqrt(1 - rho_split^2) * eps,
+```
+
+where `S_proxy` is outside the stable disease-core mask. Modalities may observe this semantic node, so ERM can exploit it, but it should not be necessary for robust prediction.
+
+Expected behavior:
+
+1. ERM should degrade under the proxy shift.
+2. CoreRank should preserve more OOD AUROC by using cross-modal, nuisance-adjusted evidence for the stable disease-core subset.
+3. Target-core recovery `R2(S_core | z_hat)` should remain more predictive of OOD AUROC than non-core proxy recovery.
+
+### 6.6 Case-IV: missing information / incomplete core coverage
 
 Purpose: test that posterior uncertainty and rank score predict degradation under missing modalities.
 
@@ -510,7 +528,7 @@ Evaluate the same model using one modality at a time. This gives the modality su
 
 The current code implements:
 
-1. synthetic data generation for complementary, redundant, biased, and domain-shift scenarios;
+1. synthetic data generation for complementary, redundant, shortcut, measurement-shift, and semantic-proxy-shift scenarios;
 2. CoreRankVAE with PoE posterior, private nuisance variables, soft footprint gates;
 3. decoder-induced nuisance-adjusted Fisher via autograd Jacobians;
 4. normalized-logdet core-rank constraint;
@@ -519,11 +537,11 @@ The current code implements:
 7. missing-modality evaluation over all modality subsets;
 8. ERM baseline;
 9. true-generator Fisher/rank diagnostics for the synthetic benchmark;
-10. bias/domain leakage probes from learned innovation `e_hat` and raw latent `z_hat`;
+10. oracle shortcut/domain leakage probes from learned innovation `e_hat` and raw latent `z_hat` for synthetic diagnostics only;
 11. temperature annealing and binary pressure options for soft footprint gates;
 12. SEM innovation prior with a soft core structural graph, acyclicity, and sparsity penalties;
-13. context-invariance penalties for known non-core variables, applied to innovation coordinates;
-14. ID and OOD test splits plus prediction-sufficient checkpoint selection;
+13. observed demographic/comorbidity covariates as ordinary modalities, not privileged context inputs;
+14. ID and OOD test splits plus prediction-sufficient checkpoint selection using ID validation labels only;
 15. metrics and CSV/JSON output.
 
 The first code drop does **not** implement:
@@ -546,8 +564,9 @@ Run at least 5 seeds per cell.
 Scenario grid:
   complementary
   redundant
-  biased
-  domain
+  shortcut
+  measurement
+  semantic
 
 Sample sizes:
   1000, 3000, 10000
@@ -555,10 +574,10 @@ Sample sizes:
 Noise std:
   0.2, 0.5, 1.0
 
-Bias strength:
+Shortcut strength:
   0.0, 1.0, 2.0
 
-Domain shift strength:
+Measurement shift strength:
   0.0, 1.0, 1.5, 2.0
 
 Training variants:
@@ -572,11 +591,12 @@ Primary plots:
 
 1. `logdet(Kbar_O)` vs latent R2 across modality subsets.
 2. `logdet(Kbar_O)` vs AUROC across modality subsets.
-3. test-OOD AUROC under bias shift.
+3. test-OOD AUROC under demographic/comorbidity shortcut shift.
 4. test-OOD AUROC under domain/mechanism shift.
-5. learned gate heatmap vs true footprint.
-6. learned-decoder rank vs true-generator rank.
-7. eigenvalue spectra for single modalities and all modalities.
+5. test-OOD AUROC under semantic proxy shift.
+6. learned gate heatmap vs true footprint.
+7. learned-decoder rank vs true-generator rank.
+8. eigenvalue spectra for single modalities and all modalities.
 
 ---
 

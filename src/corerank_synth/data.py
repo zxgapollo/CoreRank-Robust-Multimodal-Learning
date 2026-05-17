@@ -9,7 +9,7 @@ import torch
 
 @dataclass
 class SyntheticConfig:
-    scenario: str = "complementary"  # complementary | redundant | biased | domain
+    scenario: str = "complementary"  # complementary | redundant | shortcut | measurement | semantic
     seed: int = 0
     n_train: int = 5000
     n_val: int = 1000
@@ -30,7 +30,7 @@ class SyntheticConfig:
     standardize: bool = True
 
     def __post_init__(self) -> None:
-        valid_scenarios = {"complementary", "redundant", "biased", "domain"}
+        valid_scenarios = {"complementary", "redundant", "biased", "domain", "shortcut", "measurement", "semantic"}
         if self.scenario not in valid_scenarios:
             raise ValueError(f"scenario must be one of {sorted(valid_scenarios)}, got {self.scenario!r}")
         for name in ("n_train", "n_val", "n_test", "z_dim", "u_dim", "n_modalities", "x_dim"):
@@ -54,6 +54,7 @@ class SyntheticConfig:
 @dataclass
 class SyntheticParams:
     footprint: np.ndarray  # [M, r]
+    core_mask: np.ndarray  # [r], stable task-core coordinates in the semantic factor graph.
     core_graph: np.ndarray  # [r, r], core_graph[child, parent] is a directed effect.
     A: List[np.ndarray]    # each [d, r]
     B: List[np.ndarray]    # each [d, q]
@@ -108,6 +109,22 @@ def collate_batch(items: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
 
 def make_footprint(cfg: SyntheticConfig) -> np.ndarray:
     r, m = cfg.z_dim, cfg.n_modalities
+    if r == 6 and m == 4:
+        if cfg.scenario == "redundant":
+            fp = np.array([
+                [0, 0, 1, 1, 0, 0],
+                [0, 0, 0, 1, 1, 0],
+                [0, 0, 1, 1, 0, 0],
+                [1, 1, 0, 0, 0, 1],
+            ], dtype=np.float32)
+        else:
+            fp = np.array([
+                [0, 0, 1, 1, 0, 0],
+                [0, 0, 0, 1, 1, 0],
+                [0, 0, 1, 0, 1, 0],
+                [1, 1, 0, 0, 0, 1],
+            ], dtype=np.float32)
+        return fp
     if r == 6 and m == 3:
         if cfg.scenario == "redundant":
             fp = np.array([
@@ -136,6 +153,22 @@ def make_footprint(cfg: SyntheticConfig) -> np.ndarray:
     return fp
 
 
+def make_core_mask(cfg: SyntheticConfig) -> np.ndarray:
+    """Coordinates defining the stable disease-core subspace.
+
+    The remaining semantic coordinates may be parents, children, risk factors,
+    demographic/comorbidity proxies, or measurement-related variables. They can
+    affect modalities and correlate with the label in train, but they are not
+    stable decision coordinates.
+    """
+    mask = np.zeros(cfg.z_dim, dtype=np.float32)
+    if cfg.z_dim >= 6:
+        mask[[2, 3, 4]] = 1.0
+    else:
+        mask[: max(1, cfg.z_dim // 2)] = 1.0
+    return mask
+
+
 def make_core_graph(cfg: SyntheticConfig) -> np.ndarray:
     """Return a simple acyclic latent causal graph among disease-core coordinates.
 
@@ -162,6 +195,7 @@ def make_core_graph(cfg: SyntheticConfig) -> np.ndarray:
 def _make_params(cfg: SyntheticConfig) -> SyntheticParams:
     rng = np.random.default_rng(cfg.seed)
     fp = make_footprint(cfg)
+    core_mask = make_core_mask(cfg)
     core_graph = make_core_graph(cfg)
     A, B, bias_vec, domain_vec = [], [], [], []
     for mm in range(cfg.n_modalities):
@@ -179,9 +213,9 @@ def _make_params(cfg: SyntheticConfig) -> SyntheticParams:
         B.append(Bm.astype(np.float32))
         bias_vec.append(bv.astype(np.float32))
         domain_vec.append(dv.astype(np.float32))
-    beta_y = rng.normal(0, 1.0, size=(cfg.z_dim,)).astype(np.float32)
+    beta_y = rng.normal(0, 1.0, size=(cfg.z_dim,)).astype(np.float32) * core_mask
     beta_y = beta_y / (np.linalg.norm(beta_y) + 1e-6) * 1.5
-    return SyntheticParams(fp, core_graph, A, B, bias_vec, domain_vec, beta_y, cfg.noise_std)
+    return SyntheticParams(fp, core_mask, core_graph, A, B, bias_vec, domain_vec, beta_y, cfg.noise_std)
 
 
 def _sample_core(n: int, cfg: SyntheticConfig, params: SyntheticParams, rng: np.random.Generator) -> np.ndarray:
@@ -207,14 +241,25 @@ def _generate_split(n: int, cfg: SyntheticConfig, params: SyntheticParams, split
     y = rng.binomial(1, p).astype(np.float32)
     y_sign = 2.0 * y - 1.0
 
+    if cfg.scenario == "semantic":
+        rho_proxy = cfg.train_bias_corr if split in {"train", "val"} else cfg.test_bias_corr
+        eps_proxy = rng.normal(0, 1, size=(n,)).astype(np.float32)
+        proxy = rho_proxy * y_sign + np.sqrt(max(0.0, 1.0 - rho_proxy ** 2)) * eps_proxy
+        z[:, 0] = (proxy - proxy.mean()) / (proxy.std() + 1e-6)
+
     rho = 0.0
-    if cfg.scenario == "biased":
+    if cfg.scenario in {"biased", "shortcut"}:
         rho = cfg.train_bias_corr if split in {"train", "val"} else cfg.test_bias_corr
     elif cfg.bias_strength > 0:
         rho = cfg.train_bias_corr if split in {"train", "val"} else cfg.test_bias_corr
 
-    domain_mean = 1.0 if cfg.scenario == "domain" and split == "test" else 0.0
-    domain = (domain_mean + 0.1 * rng.normal(0, 1, size=(n,))).astype(np.float32)
+    if cfg.scenario in {"domain", "measurement"}:
+        rho_domain = cfg.train_bias_corr if split in {"train", "val"} else cfg.test_bias_corr
+        eps_domain = rng.normal(0, 1, size=(n,)).astype(np.float32)
+        domain = rho_domain * y_sign + np.sqrt(max(0.0, 1.0 - rho_domain ** 2)) * eps_domain
+    else:
+        domain_mean = 1.0 if cfg.scenario == "domain" and split == "test" else 0.0
+        domain = (domain_mean + 0.1 * rng.normal(0, 1, size=(n,))).astype(np.float32)
 
     xs, us, biases = [], [], []
     for mm in range(cfg.n_modalities):

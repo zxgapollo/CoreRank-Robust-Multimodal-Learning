@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from corerank_synth.data import SyntheticConfig, make_core_graph, make_footprint, make_synthetic_data
+from corerank_synth.data import SyntheticConfig, make_core_graph, make_core_mask, make_footprint, make_synthetic_data
 
 
 def test_default_complementary_footprint_matches_design() -> None:
@@ -30,6 +30,17 @@ def test_redundant_footprint_duplicates_first_modality() -> None:
     np.testing.assert_array_equal(fp[0], fp[2])
 
 
+def test_four_modality_design_treats_covariates_as_a_modality() -> None:
+    cfg = SyntheticConfig(scenario="shortcut", z_dim=6, n_modalities=4)
+
+    fp = make_footprint(cfg)
+    core_mask = make_core_mask(cfg).astype(bool)
+
+    assert fp.shape == (4, 6)
+    assert fp[-1, core_mask].sum() == 0.0
+    assert fp[-1, ~core_mask].sum() > 0.0
+
+
 def test_core_graph_is_acyclic_and_nonzero() -> None:
     cfg = SyntheticConfig(scenario="complementary", z_dim=6, n_modalities=3, core_graph_strength=0.4)
 
@@ -38,6 +49,17 @@ def test_core_graph_is_acyclic_and_nonzero() -> None:
     assert graph.shape == (cfg.z_dim, cfg.z_dim)
     assert np.count_nonzero(graph) > 0
     assert np.allclose(np.triu(graph), 0.0)
+
+
+def test_label_uses_stable_core_subset() -> None:
+    cfg = SyntheticConfig(scenario="semantic", seed=7, z_dim=6, n_modalities=4)
+
+    _, _, _, params = make_synthetic_data(cfg)
+    core_mask = params.core_mask.astype(bool)
+
+    assert core_mask.sum() == 3
+    assert np.all(params.beta_y[~core_mask] == 0.0)
+    assert np.linalg.norm(params.beta_y[core_mask]) > 0.0
 
 
 def test_biased_scenario_biases_only_configured_modality() -> None:
@@ -63,9 +85,9 @@ def test_biased_scenario_biases_only_configured_modality() -> None:
     assert corr_to_label[1] > max(corr_to_label[0], corr_to_label[2])
 
 
-def test_domain_scenario_shifts_only_configured_modality() -> None:
+def test_measurement_scenario_flips_label_correlated_artifact_only_configured_modality() -> None:
     cfg = SyntheticConfig(
-        scenario="domain",
+        scenario="measurement",
         seed=23,
         n_train=256,
         n_val=64,
@@ -76,14 +98,18 @@ def test_domain_scenario_shifts_only_configured_modality() -> None:
     )
 
     train, _, test, params = make_synthetic_data(cfg)
-    shifts = []
+    corr_changes = []
+    y_train = 2.0 * train.y.numpy().reshape(-1) - 1.0
+    y_test = 2.0 * test.y.numpy().reshape(-1) - 1.0
     for m in range(cfg.n_modalities):
         direction = params.domain_vec[m]
         train_projection = train.x[m].numpy() @ direction
         test_projection = test.x[m].numpy() @ direction
-        shifts.append(abs(float(test_projection.mean() - train_projection.mean())))
+        train_corr = float(np.corrcoef(train_projection, y_train)[0, 1])
+        test_corr = float(np.corrcoef(test_projection, y_test)[0, 1])
+        corr_changes.append(abs(train_corr - test_corr))
 
-    assert shifts[2] > max(shifts[0], shifts[1]) + 1.0
+    assert corr_changes[2] > max(corr_changes[0], corr_changes[1]) + 0.5
 
 
 def test_config_rejects_invalid_bias_modality() -> None:

@@ -11,22 +11,22 @@ from .train import TrainConfig, train_corerank, train_erm_baseline
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run CoreRank synthetic benchmark.")
-    p.add_argument("--scenario", type=str, default="complementary", choices=["complementary", "redundant", "biased", "domain"])
+    p.add_argument("--scenario", type=str, default="complementary", choices=["complementary", "redundant", "biased", "domain", "shortcut", "measurement", "semantic"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-train", type=int, default=5000)
     p.add_argument("--n-val", type=int, default=1000)
     p.add_argument("--n-test", type=int, default=2000)
     p.add_argument("--z-dim", type=int, default=6)
     p.add_argument("--u-dim", type=int, default=3)
-    p.add_argument("--n-modalities", type=int, default=3)
+    p.add_argument("--n-modalities", type=int, default=4)
     p.add_argument("--x-dim", type=int, default=16)
     p.add_argument("--noise-std", type=float, default=0.35)
     p.add_argument("--bias-strength", type=float, default=None)
-    p.add_argument("--biased-modality", type=int, default=0)
+    p.add_argument("--biased-modality", type=int, default=None)
     p.add_argument("--train-bias-corr", type=float, default=0.85)
     p.add_argument("--test-bias-corr", type=float, default=-0.50)
     p.add_argument("--domain-shift-strength", type=float, default=None)
-    p.add_argument("--domain-shifted-modality", type=int, default=0)
+    p.add_argument("--domain-shifted-modality", type=int, default=None)
     p.add_argument("--core-graph-strength", type=float, default=0.35)
 
     p.add_argument("--epochs", type=int, default=50)
@@ -43,13 +43,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dag-weight", type=float, default=0.1)
     p.add_argument("--graph-l1-weight", type=float, default=0.01)
     p.add_argument("--structural-warmup-epochs", type=int, default=0)
-    p.add_argument("--bias-invariance-weight", type=float, default=0.0)
-    p.add_argument("--domain-invariance-weight", type=float, default=0.0)
     p.add_argument("--no-sem-prior", action="store_true")
     p.add_argument("--rank-on-z", action="store_true")
     p.add_argument("--no-select-best", action="store_true")
     p.add_argument("--best-id-tolerance", type=float, default=0.02)
-    p.add_argument("--best-leakage-weight", type=float, default=0.0)
     p.add_argument("--rank-kappa", type=float, default=0.5)
     p.add_argument("--sparse-budget", type=float, default=9.0)
     p.add_argument("--rho-rank", type=float, default=1.0)
@@ -87,10 +84,16 @@ def main() -> None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     bias_strength = args.bias_strength
     if bias_strength is None:
-        bias_strength = 2.0 if args.scenario == "biased" else 0.0
+        bias_strength = 2.5 if args.scenario in {"biased", "shortcut"} else 0.0
+    biased_modality = args.biased_modality
+    if biased_modality is None:
+        biased_modality = args.n_modalities - 1 if args.scenario in {"biased", "shortcut"} else 0
     domain_shift_strength = args.domain_shift_strength
     if domain_shift_strength is None:
-        domain_shift_strength = 1.5 if args.scenario == "domain" else 0.0
+        domain_shift_strength = 2.0 if args.scenario in {"domain", "measurement"} else 0.0
+    domain_shifted_modality = args.domain_shifted_modality
+    if domain_shifted_modality is None:
+        domain_shifted_modality = 0
 
     scfg = SyntheticConfig(
         scenario=args.scenario,
@@ -104,11 +107,11 @@ def main() -> None:
         x_dim=args.x_dim,
         noise_std=args.noise_std,
         bias_strength=bias_strength,
-        biased_modality=args.biased_modality,
+        biased_modality=biased_modality,
         train_bias_corr=args.train_bias_corr,
         test_bias_corr=args.test_bias_corr,
         domain_shift_strength=domain_shift_strength,
-        domain_shifted_modality=args.domain_shifted_modality,
+        domain_shifted_modality=domain_shifted_modality,
         core_graph_strength=args.core_graph_strength,
     )
     tcfg = TrainConfig(
@@ -126,13 +129,10 @@ def main() -> None:
         dag_weight=args.dag_weight,
         graph_l1_weight=args.graph_l1_weight,
         structural_warmup_epochs=args.structural_warmup_epochs,
-        bias_invariance_weight=args.bias_invariance_weight,
-        domain_invariance_weight=args.domain_invariance_weight,
         use_sem_prior=not args.no_sem_prior,
         rank_on_innovation=not args.rank_on_z,
         select_best=not args.no_select_best,
         best_id_tolerance=args.best_id_tolerance,
-        best_leakage_weight=args.best_leakage_weight,
         rank_kappa=args.rank_kappa,
         sparse_budget=args.sparse_budget,
         rho_rank=args.rho_rank,

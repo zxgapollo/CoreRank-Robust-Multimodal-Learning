@@ -36,13 +36,10 @@ class TrainConfig:
     dag_weight: float = 0.1
     graph_l1_weight: float = 0.01
     structural_warmup_epochs: int = 0
-    bias_invariance_weight: float = 0.0
-    domain_invariance_weight: float = 0.0
     use_sem_prior: bool = True
     rank_on_innovation: bool = True
     select_best: bool = True
     best_id_tolerance: float = 0.02
-    best_leakage_weight: float = 0.0
     rank_kappa: float = 0.5
     sparse_budget: float = 9.0
     rho_rank: float = 1.0
@@ -102,10 +99,6 @@ def _to_device(batch: Dict, device: str) -> Dict:
     }
 
 
-def _make_context(batch: Dict, scfg: SyntheticConfig) -> torch.Tensor:
-    return torch.cat([batch["bias"][scfg.biased_modality], batch["domain"]], dim=-1)
-
-
 def _standardize_batch(x: torch.Tensor) -> torch.Tensor:
     return (x - x.mean(dim=0, keepdim=True)) / x.std(dim=0, keepdim=True).clamp_min(1e-5)
 
@@ -123,10 +116,9 @@ def _vae_step_losses(
     model: CoreRankVAE,
     batch: Dict,
     obs_mask: torch.Tensor,
-    context: torch.Tensor,
     tcfg: TrainConfig,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict]:
-    out = model(batch["x"], obs_mask, context=context, sample=True)
+    out = model(batch["x"], obs_mask, sample=True)
     sigma2 = model.cfg.decoder_noise_std ** 2
     recon_loss = torch.tensor(0.0, device=batch["y"].device)
     for m, rec in enumerate(out["recon"]):
@@ -140,7 +132,7 @@ def _vae_step_losses(
         recon_loss = recon_loss + (obs_mask[:, m] * 0.5 * mse_m / sigma2).mean()
     label_loss = F.binary_cross_entropy_with_logits(out["logits"], batch["y"], reduction="mean")
     if tcfg.use_sem_prior:
-        kl_z = kl_sem_normal(out["z_mu"], out["z_logvar"], model.core_graph, context).mean()
+        kl_z = kl_sem_normal(out["z_mu"], out["z_logvar"], model.core_graph).mean()
     else:
         kl_z = kl_standard_normal(out["z_mu"], out["z_logvar"]).mean()
     kl_u = torch.tensor(0.0, device=batch["y"].device)
@@ -183,7 +175,6 @@ def train_corerank(
         gate_temperature=tcfg.gate_temperature,
         init_gate_logit=tcfg.init_gate_logit,
         decoder_noise_std=scfg.noise_std,
-        context_dim=2,
         structural_classifier=tcfg.structural_classifier,
     )
     model = CoreRankVAE(model_cfg).to(device)
@@ -211,23 +202,20 @@ def train_corerank(
 
         for batch0 in pbar:
             batch = _to_device(batch0, device)
-            context = _make_context(batch, scfg)
             obs_mask = _make_obs_mask(batch["y"].shape[0], scfg.n_modalities, device, tcfg.modality_dropout)
             opt.zero_grad(set_to_none=True)
-            nll, logs, out = _vae_step_losses(model, batch, obs_mask, context, tcfg)
+            nll, logs, out = _vae_step_losses(model, batch, obs_mask, tcfg)
             loss = nll
 
             structural_z = _standardize_batch(out["z_mu"])
-            structural_context = _standardize_batch(context)
-            structural_loss = 0.5 * model.core_graph.innovation(structural_z, structural_context).pow(2).mean()
+            structural_loss = 0.5 * model.core_graph.innovation(structural_z).pow(2).mean()
             dag_penalty = model.core_graph.acyclicity()
             graph_l1 = model.core_graph.l1()
+            # Bias/domain labels are synthetic oracle diagnostics. They are no longer
+            # used as training constraints because observed covariates should enter
+            # as modalities, not as privileged context variables.
             bias_invariance = torch.tensor(0.0, device=device)
-            if scfg.bias_strength > 0 and tcfg.bias_invariance_weight > 0:
-                bias_invariance = _linear_invariance_penalty(out["innovation_mu"], batch["bias"][scfg.biased_modality])
             domain_invariance = torch.tensor(0.0, device=device)
-            if scfg.domain_shift_strength > 0 and tcfg.domain_invariance_weight > 0:
-                domain_invariance = _linear_invariance_penalty(out["innovation_mu"], batch["domain"])
             if structural_active:
                 if tcfg.structural_weight > 0:
                     loss = loss + tcfg.structural_weight * structural_loss
@@ -235,11 +223,6 @@ def train_corerank(
                     loss = loss + tcfg.dag_weight * dag_penalty.pow(2)
                 if tcfg.graph_l1_weight > 0:
                     loss = loss + tcfg.graph_l1_weight * graph_l1
-            if tcfg.bias_invariance_weight > 0:
-                loss = loss + tcfg.bias_invariance_weight * bias_invariance
-            if tcfg.domain_invariance_weight > 0:
-                loss = loss + tcfg.domain_invariance_weight * domain_invariance
-
             rank_score = torch.tensor(0.0, device=device)
             rank_violation = torch.tensor(0.0, device=device)
             if rank_active:
@@ -311,7 +294,7 @@ def train_corerank(
             val_metrics = _quick_prediction_metrics(model, val, scfg, tcfg, tuple(range(scfg.n_modalities)))
             summary["val_full_auroc"] = val_metrics["auroc"]
             summary["val_full_accuracy"] = val_metrics["accuracy"]
-            summary["val_context_leakage_r2"] = val_metrics["context_leakage_r2"]
+            summary["val_oracle_shortcut_leakage_r2"] = val_metrics["oracle_shortcut_leakage_r2"]
             summary["val_robust_score"] = val_metrics["robust_score"]
             if np.isfinite(val_metrics["auroc"]):
                 checkpoint_candidates.append({
@@ -319,7 +302,7 @@ def train_corerank(
                     "state": deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()}),
                     "val_auroc": float(val_metrics["auroc"]),
                     "val_accuracy": float(val_metrics["accuracy"]),
-                    "val_context_leakage_r2": float(val_metrics["context_leakage_r2"]),
+                    "val_oracle_shortcut_leakage_r2": float(val_metrics["oracle_shortcut_leakage_r2"]),
                     "val_robust_score": float(val_metrics["robust_score"]),
                 })
         history.append(summary)
@@ -334,22 +317,13 @@ def train_corerank(
         feasible = [c for c in checkpoint_candidates if c["val_auroc"] >= best_val_auc_floor]
         if not feasible:
             feasible = checkpoint_candidates
-        if tcfg.best_leakage_weight > 0:
-            best_summary = max(
-                feasible,
-                key=lambda c: (c["val_robust_score"], c["val_auroc"], -c["val_context_leakage_r2"]),
-            )
-        else:
-            best_summary = max(
-                feasible,
-                key=lambda c: (c["val_auroc"], -c["val_context_leakage_r2"]),
-            )
+        best_summary = max(feasible, key=lambda c: c["val_auroc"])
         model.load_state_dict(best_summary["state"])
     metrics, subset_df = evaluate_model(model, train, val, test, params, scfg, tcfg, id_test=id_test)
     metrics["best_epoch"] = int(best_summary["epoch"]) if best_summary is not None else 0
     metrics["best_val_auroc"] = float(best_summary["val_auroc"]) if best_summary is not None else float("nan")
     metrics["best_val_accuracy"] = float(best_summary["val_accuracy"]) if best_summary is not None else float("nan")
-    metrics["best_val_context_leakage_r2"] = float(best_summary["val_context_leakage_r2"]) if best_summary is not None else float("nan")
+    metrics["best_val_oracle_shortcut_leakage_r2"] = float(best_summary["val_oracle_shortcut_leakage_r2"]) if best_summary is not None else float("nan")
     metrics["best_val_robust_score"] = float(best_summary["val_robust_score"]) if best_summary is not None else float("nan")
     metrics["best_val_auc_target"] = float(best_val_auc)
     metrics["best_val_auc_floor"] = float(best_val_auc_floor)
@@ -364,6 +338,7 @@ def train_corerank(
     torch.save(model.state_dict(), os.path.join(output_dir, "model.pt"))
     np.save(os.path.join(output_dir, "gates.npy"), model.gates().detach().cpu().numpy())
     np.save(os.path.join(output_dir, "true_footprint.npy"), params.footprint)
+    np.save(os.path.join(output_dir, "true_core_mask.npy"), params.core_mask)
     np.save(os.path.join(output_dir, "learned_core_graph.npy"), learned_core_graph)
     np.save(os.path.join(output_dir, "true_core_graph.npy"), params.core_graph)
     pd.DataFrame(history).to_csv(os.path.join(output_dir, "train_history.csv"), index=False)
@@ -383,9 +358,8 @@ def _collect_predictions(model: CoreRankVAE, split: SyntheticSplit, scfg: Synthe
     model.eval()
     for batch0 in loader:
         batch = _to_device(batch0, device)
-        context = _make_context(batch, scfg)
         obs_mask = obs_template.unsqueeze(0).expand(batch["y"].shape[0], -1)
-        out = model(batch["x"], obs_mask, context=context, sample=False)
+        out = model(batch["x"], obs_mask, sample=False)
         prob = torch.sigmoid(out["logits"])
         zs.append(out["z_mu"].cpu().numpy())
         e_hats.append(out["innovation_mu"].cpu().numpy())
@@ -426,8 +400,10 @@ def _quick_prediction_metrics(
         leakage += linear_probe_r2(pred["e_hat"], pred["bias"][:, [scfg.biased_modality]])
     if scfg.domain_shift_strength > 0:
         leakage += linear_probe_r2(pred["e_hat"], pred["domain"])
-    metrics["context_leakage_r2"] = float(leakage)
-    metrics["robust_score"] = float(metrics["auroc"] - tcfg.best_leakage_weight * leakage)
+    metrics["oracle_shortcut_leakage_r2"] = float(leakage)
+    # Leakage is reported as an oracle diagnostic only; it is not used for model
+    # selection because real covariates are part of the modality set.
+    metrics["robust_score"] = float(metrics["auroc"])
     return metrics
 
 
@@ -444,8 +420,7 @@ def _estimate_rank_diagnostics(model: CoreRankVAE, split: SyntheticSplit, scfg: 
             break
         batch = _to_device(batch0, device)
         obs_mask = obs_template.unsqueeze(0).expand(batch["y"].shape[0], -1)
-        context = _make_context(batch, scfg)
-        out = model(batch["x"], obs_mask, context=context, sample=False)
+        out = model(batch["x"], obs_mask, sample=False)
         K = batch_core_information(
             model, out["z_mu"], out["u_mu"], obs_mask,
             noise_std=scfg.noise_std,
@@ -530,6 +505,20 @@ def evaluate_model(
                 true_e = _true_innovation(split, params)
                 row["innovation_r2"] = ridge_r2(pred["e_hat"], true_e)
                 row["innovation_mcc"] = mean_corrcoef_matching(pred["e_hat"], true_e)
+                core_mask = params.core_mask.astype(bool)
+                if core_mask.any():
+                    row["target_core_r2"] = ridge_r2(pred["z_hat"], pred["z_true"][:, core_mask])
+                    row["target_innovation_r2"] = ridge_r2(pred["e_hat"], true_e[:, core_mask])
+                else:
+                    row["target_core_r2"] = float("nan")
+                    row["target_innovation_r2"] = float("nan")
+                noncore_mask = ~core_mask
+                if noncore_mask.any():
+                    row["noncore_latent_r2"] = ridge_r2(pred["z_hat"], pred["z_true"][:, noncore_mask])
+                    row["noncore_innovation_r2"] = ridge_r2(pred["e_hat"], true_e[:, noncore_mask])
+                else:
+                    row["noncore_latent_r2"] = float("nan")
+                    row["noncore_innovation_r2"] = float("nan")
                 if scfg.bias_strength > 0:
                     bias_target = pred["bias"][:, [scfg.biased_modality]]
                     row["bias_leakage_r2"] = linear_probe_r2(pred["e_hat"], bias_target)
@@ -561,6 +550,7 @@ def evaluate_model(
         "final_gates": gates.tolist(),
         "learned_core_graph": learned_core_graph.tolist(),
         "true_core_graph": params.core_graph.tolist(),
+        "true_core_mask": params.core_mask.tolist(),
         "full_test": subset_df[(subset_df.split == "test") & (subset_df.subset_size == scfg.n_modalities)].iloc[0].to_dict(),
     }
     if id_test is not None:
