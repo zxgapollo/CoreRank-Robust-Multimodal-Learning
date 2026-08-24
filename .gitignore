@@ -6,9 +6,37 @@ __pycache__/
 .mypy_cache/
 .venv/
 venv/
+
+# Generated experiment artifacts
 outputs/
-*.pt
-*.pth
+logs/
+
+# Local datasets and caches
+data/
+datasets/
+cache/
+caches/
 *.npy
 *.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.nii
+*.nii.gz
+*.dcm
+*.parquet
+*.feather
+*.arrow
+
+# Trained checkpoints and weights
+checkpoint/
+checkpoints/
+ckpt/
+weights/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
 .DS_Store

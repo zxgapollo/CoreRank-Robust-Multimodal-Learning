@@ -1,4 +1,68 @@
-# CoreRank Synthetic Benchmark
+# Intrinsic State Observability Synthetic Experiments
+
+This repo now contains a clean first-round PyTorch synthetic benchmark for the
+**Intrinsic State Observability (ISO)** hypothesis:
+
+> Multimodal learning improves over unimodal learning when additional modalities
+> reduce label-relevant ambiguity of an intrinsic latent state `S*`, rather than
+> merely adding raw information.
+
+The new implementation lives in `src/iso_synth` and follows the structural
+generator
+
+```text
+Y ~ p(Y | S*)
+X_i = g_i(A_i S* + B_i U_i + C_i Q + eps_i)
+```
+
+It implements:
+
+- synthetic generator for complementary, redundant, nuisance-only, shortcut,
+  noisy-modality, and mediated-context cases;
+- source `train`/`val`/`id_test` splits and a target OOD `test` split where the
+  latent state graph and label mechanism remain fixed while modality residuals,
+  nuisance-label correlations, shortcut correlations, or noise quality shift;
+- `UnimodalMLP`, `ConcatMLP`, `LateFusionMLP`, `ISO-PoE`, and
+  `OracleStateMLP` baselines;
+- oracle label-relevant observability `lambda_Y(M)`;
+- state ambiguity proxy `Uhat_Y(M)`;
+- AUC / ACC / NLL plus state recovery R2 / CKA / MCC;
+- sample-complexity grids and the five first-round figures.
+
+## ISO quick start
+
+```bash
+python -m iso_synth.run_experiment \
+  --scenarios complementary,redundant,nuisance_only,shortcut,noisy_modality,mediated_context \
+  --n-train-grid 128,512 \
+  --seeds 0 \
+  --epochs 10 \
+  --output-dir outputs/iso_first_pass
+```
+
+Smoke run:
+
+```bash
+bash scripts/run_iso_smoke.sh
+```
+
+Expected outputs:
+
+```text
+outputs/iso_first_pass/results.csv
+outputs/iso_first_pass/figures/fig_observability_vs_auc.png
+outputs/iso_first_pass/figures/fig_ambiguity_vs_nll.png
+outputs/iso_first_pass/figures/fig_sample_complexity.png
+outputs/iso_first_pass/figures/fig_shortcut_ood.png
+outputs/iso_first_pass/figures/fig_state_recovery.png
+```
+
+The older CoreRank synthetic prototype is still available under
+`src/corerank_synth` for reference.
+
+---
+
+# Legacy CoreRank Synthetic Benchmark
 
 This repository contains a first synthetic benchmark and PyTorch implementation for a constrained-likelihood CoreRank model.
 
@@ -105,5 +169,5 @@ bash scripts/run_farm_smoke.sh
 Submit the full synthetic grid as a detached Slurm job:
 
 ```bash
-bash scripts/submit_farm_main.sh outputs/main_grid_gpu
+SLURM_ACCOUNT=ctbrowngrp bash scripts/submit_farm_iso_main.sh outputs/iso_ood_main_grid_gpu
 ```
